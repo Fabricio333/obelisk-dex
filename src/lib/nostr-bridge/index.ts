@@ -1,4 +1,4 @@
-export { getBridge, getBridgeSync, decodeNsec } from './client';
+export { getBridge, getBridgeSync, getBridgeImpl, decodeNsec } from './client';
 export { nostrActions } from './actions';
 export {
   useIsLoggedIn,

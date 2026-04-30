@@ -11,7 +11,8 @@
  *   • New-account flow generates a fresh nsec via nostr-tools.
  */
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { QRCodeSVG } from 'qrcode.react';
 import { generateSecretKey, getPublicKey, nip19 } from 'nostr-tools';
 import { nostrActions, decodeNsec } from '@/lib/nostr-bridge';
 
@@ -29,6 +30,11 @@ export default function LoginModal({ onSuccess }: { onSuccess?: () => void } = {
   const [nsecCopied, setNsecCopied] = useState(false);
   const [creatingAccount, setCreatingAccount] = useState(false);
   const [backupConfirmed, setBackupConfirmed] = useState(false);
+  const [connectUri, setConnectUri] = useState('');
+  const [waitingForScan, setWaitingForScan] = useState(false);
+  const [authChallengeUrl, setAuthChallengeUrl] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const qrSessionRef = useRef<{ cancel: () => void } | null>(null);
 
   const isLoading = loadingMethod !== null || creatingAccount;
 
@@ -53,7 +59,9 @@ export default function LoginModal({ onSuccess }: { onSuccess?: () => void } = {
         }
         case 'bunker': {
           if (!bunkerInput.trim()) throw new Error('Please enter your bunker URL');
-          await nostrActions.loginWithBunker(bunkerInput.trim());
+          await nostrActions.loginWithBunker(bunkerInput.trim(), {
+            onAuthUrl: (url) => setAuthChallengeUrl(url),
+          });
           break;
         }
       }
@@ -68,7 +76,59 @@ export default function LoginModal({ onSuccess }: { onSuccess?: () => void } = {
   const handleBack = useCallback(() => {
     setMethod(null);
     setError(null);
+    if (qrSessionRef.current) {
+      qrSessionRef.current.cancel();
+      qrSessionRef.current = null;
+    }
+    setConnectUri('');
+    setWaitingForScan(false);
+    setAuthChallengeUrl(null);
   }, []);
+
+  // Generate a nostrconnect:// URI when the QR tab opens; await scan + connect.
+  useEffect(() => {
+    if (method !== 'bunker' || bunkerTab !== 'qr') return;
+    let cancelled = false;
+    setError(null);
+    setConnectUri('');
+    setWaitingForScan(true);
+    setAuthChallengeUrl(null);
+
+    (async () => {
+      try {
+        const session = await nostrActions.createNostrConnectSession({
+          onAuthUrl: (url) => { if (!cancelled) setAuthChallengeUrl(url); },
+        });
+        if (cancelled) { session.cancel(); return; }
+        qrSessionRef.current = { cancel: session.cancel };
+        setConnectUri(session.uri);
+        await session.waitForConnection();
+        if (cancelled) return;
+        onSuccess?.();
+      } catch (err) {
+        if (cancelled) return;
+        const msg = err instanceof Error ? err.message : 'NostrConnect failed';
+        if (msg !== 'NostrConnect cancelled') setError(msg);
+      } finally {
+        if (!cancelled) setWaitingForScan(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (qrSessionRef.current) {
+        qrSessionRef.current.cancel();
+        qrSessionRef.current = null;
+      }
+    };
+  }, [method, bunkerTab, onSuccess]);
+
+  const handleCopyUri = useCallback(async () => {
+    if (!connectUri) return;
+    try { await navigator.clipboard.writeText(connectUri); } catch { /* ignore */ }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }, [connectUri]);
 
   const handleCreateAccount = useCallback(async () => {
     setCreatingAccount(true);
@@ -390,11 +450,56 @@ ${newAccountNsec}
             </div>
 
             {bunkerTab === 'qr' ? (
-              <div className="rounded-xl border border-lc-border/50 bg-lc-black p-6 text-center">
-                <p className="text-sm text-lc-muted">
-                  NIP-46 QR connect is not yet wired up in this build. Use the <span className="font-semibold text-lc-white">Bunker URL</span> tab if your signer
-                  gives you a <code className="rounded bg-lc-card px-1 font-mono text-xs">bunker://</code> URL — or sign in with nsec / extension instead.
-                </p>
+              <div className="space-y-4">
+                {authChallengeUrl ? (
+                  <div className="rounded-xl border border-lc-green/30 bg-lc-green/5 p-4 text-center">
+                    <p className="mb-3 text-sm text-lc-white">Your signer needs you to approve this login.</p>
+                    <a
+                      href={authChallengeUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="lc-pill lc-pill-primary inline-flex items-center justify-center gap-2 text-sm"
+                    >
+                      Open signer
+                    </a>
+                  </div>
+                ) : connectUri ? (
+                  <>
+                    <div className="flex items-center justify-center rounded-xl border border-lc-border/50 bg-white p-4">
+                      <QRCodeSVG value={connectUri} size={224} level="M" />
+                    </div>
+                    <div className="space-y-2">
+                      <p className="text-center text-xs text-lc-muted">
+                        Scan with your remote signer (nsec.app, Amber, etc.)
+                      </p>
+                      <a
+                        href={connectUri}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="lc-pill lc-pill-primary flex w-full items-center justify-center gap-2 text-xs"
+                      >
+                        Open in signer app
+                      </a>
+                      <button
+                        onClick={handleCopyUri}
+                        className="lc-pill lc-pill-secondary flex w-full items-center justify-center gap-2 text-xs"
+                      >
+                        {copied ? 'Copied!' : 'Copy nostrconnect:// URI'}
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <div className="rounded-xl border border-lc-border/50 bg-lc-black p-6 text-center">
+                    {waitingForScan ? (
+                      <div className="flex items-center justify-center gap-3 text-sm text-lc-muted">
+                        <div className="lc-spinner" />
+                        Generating connection URI…
+                      </div>
+                    ) : (
+                      <p className="text-sm text-lc-muted">Preparing QR code…</p>
+                    )}
+                  </div>
+                )}
               </div>
             ) : (
               <div className="space-y-4">

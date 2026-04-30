@@ -7,7 +7,7 @@
 #   ./scripts/dev-raise.sh
 #
 # Env overrides:
-#   TUNNEL_NAME        default: obelisk-dex
+#   TUNNEL_NAME        default: obelisk-dev
 #   TUNNEL_HOSTNAME    default: dex-test.obelisk.ar
 #   PORT               default: 3000
 #   PORT_FALLBACK_MAX  default: 10
@@ -24,7 +24,7 @@ if [ -f "$(dirname "$0")/../.env" ]; then
   set +a
 fi
 
-TUNNEL_NAME="${TUNNEL_NAME:-obelisk-dex}"
+TUNNEL_NAME="${TUNNEL_NAME:-obelisk-dev}"
 TUNNEL_HOST="${TUNNEL_HOSTNAME:-dex-test.obelisk.ar}"
 ORIGIN_CERT="${CLOUDFLARED_ORIGIN_CERT:-$HOME/.cloudflared/cert.pem}"
 PORT="${PORT:-3000}"

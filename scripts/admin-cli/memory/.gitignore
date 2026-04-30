@@ -1,4 +1,0 @@
-# Never commit per-server state — may contain message contents, pubkeys, etc.
-*
-!.gitignore
-!README.md

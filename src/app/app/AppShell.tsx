@@ -18,6 +18,7 @@ import {
   type JsMessage,
   type JsUserMetadata,
 } from '@/lib/nostr-bridge';
+import { getBridge, getBridgeImpl } from '@/lib/nostr-bridge';
 import { faviconFor, fetchRelayInfo } from '@/lib/relay-info';
 import ServerRail from './ServerRail';
 import DMList from './DMList';
@@ -32,6 +33,35 @@ import { useVoiceStore } from '@/store/voice';
 import { useVoiceChatPane } from '@/hooks/chat/useVoiceChatPane';
 import { useChatStore } from '@/store/chat';
 import type { MemberInfo } from '@/lib/mentions';
+import { useToastStore } from '@/store/toast';
+import { useModerationStore } from '@/store/moderation';
+import {
+  EMOJI_CATEGORIES,
+  EMOJI_CATEGORY_NAMES,
+  SEARCHABLE_EMOJI,
+  normalizeEmojiKeyword,
+} from '@/components/chat/emoji-data';
+import { useMessageZaps, type MessageZapTotal } from '@/hooks/chat/useMessageZaps';
+import { useMessageZapStore } from '@/store/messageZap';
+import MessageZapModal from '@/components/chat/MessageZapModal';
+import { parseZapCommand } from '@/lib/wallet/parse-zap-command';
+import MentionAutocomplete from '@/components/chat/MentionAutocomplete';
+import { filterMembers } from '@/lib/mentions';
+import { nip19 } from 'nostr-tools';
+import {
+  useChannelLayout,
+  useRelayOperatorPubkey,
+  applyLayout,
+  publishLayout,
+  newCategoryId,
+  type ChannelLayout,
+} from '@/lib/channel-layout';
+import {
+  useRelayBranding,
+  publishBranding,
+  type RelayBranding,
+} from '@/lib/relay-branding';
+import BlossomImageInput from '@/components/BlossomImageInput';
 
 type View =
   | { kind: 'group'; groupId: string }
@@ -96,6 +126,7 @@ export default function AppShell() {
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-lc-black text-lc-white">
+      <MessageZapModal />
       <RelayTopBar relay={relay} onOpenSidebar={() => setSidebarOpen(true)} />
       <div className="flex flex-1 overflow-hidden relative">
         {/* Mobile backdrop */}
@@ -154,6 +185,20 @@ export default function AppShell() {
             <EmptyState />
           )}
         </main>
+        <FloatingUserPanel />
+      </div>
+    </div>
+  );
+}
+
+function FloatingUserPanel() {
+  return (
+    <div
+      className="pointer-events-none absolute bottom-3 left-2 z-30 hidden md:block"
+      style={{ width: 'min(320px, calc(100vw - 16px))' }}
+    >
+      <div className="pointer-events-auto flex min-h-[3.5rem] items-center rounded-xl border border-lc-border bg-lc-card/95 px-4 shadow-2xl backdrop-blur">
+        <SidebarMe />
       </div>
     </div>
   );
@@ -334,21 +379,101 @@ function Sidebar({
     () => groups.filter((g) => !g.parent || !groupsById[g.parent]),
     [groups, groupsById],
   );
+  const myPubkey = useMyPubkey();
+  const operatorPubkey = useRelayOperatorPubkey(relay || null);
+  const layout = useChannelLayout(relay || null, operatorPubkey);
+  const isOperator = !!myPubkey && !!operatorPubkey && myPubkey === operatorPubkey;
+  const laidOut = useMemo(
+    () => applyLayout(layout, roots.map((g) => g.id)),
+    [layout, roots],
+  );
+  const branding = useRelayBranding(relay || null, operatorPubkey);
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [layoutOpen, setLayoutOpen] = useState(false);
+  const [brandingOpen, setBrandingOpen] = useState(false);
+
+  // Background admin self-claim across every visible group.
+  // NIP-29 relays SHOULD auto-promote the creator, but many don't until they
+  // see an explicit kind 9000. Without this the gear icon never appears for
+  // channels the user created. Idempotent on relays that already promoted us;
+  // rejected (and silently ignored) on channels the user doesn't own.
+  useEffect(() => {
+    if (!myPubkey || groups.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      for (const g of groups) {
+        if (cancelled) return;
+        const key = `obelisk:auto-claim-admin:${relay}:${g.id}:${myPubkey}`;
+        if (typeof sessionStorage !== 'undefined' && sessionStorage.getItem(key)) continue;
+        try { sessionStorage?.setItem(key, '1'); } catch {}
+        try { await nostrActions.putUser(g.id, myPubkey, ['admin']); } catch {}
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [groups, myPubkey, relay]);
+
+  const toggleCollapsed = (id: string) =>
+    setCollapsed((c) => ({ ...c, [id]: !c[id] }));
 
   return (
     <>
-      <div className="flex h-14 shrink-0 items-center gap-2 overflow-hidden border-b border-lc-border px-4 shadow-sm">
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-bold text-lc-white">{shortHost(relay)}</div>
-          <div className="flex items-center gap-1.5 text-[10px] text-lc-muted">
-            <span
-              className={
-                'inline-block h-1.5 w-1.5 rounded-full ' +
-                (conn === 'Connected' ? 'bg-lc-green' : conn === 'Connecting' ? 'bg-yellow-500' : 'bg-red-500')
-              }
+      <div className="shrink-0 border-b border-lc-border shadow-sm">
+        {branding.banner && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={branding.banner}
+            alt=""
+            className="h-20 w-full object-cover"
+          />
+        )}
+        <div className="flex h-14 items-center gap-3 overflow-hidden px-4">
+          {branding.icon && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={branding.icon}
+              alt=""
+              className="h-9 w-9 shrink-0 rounded-lg border border-lc-border bg-lc-black object-cover"
             />
-            {conn}
+          )}
+          <div className="min-w-0 flex-1 truncate text-base font-bold text-lc-white">
+            {branding.name || shortHost(relay)}
           </div>
+          <span
+            title={conn}
+            aria-label={conn}
+            className={
+              'inline-block h-2.5 w-2.5 shrink-0 rounded-full ' +
+              (conn === 'Connected' ? 'bg-lc-green' : conn === 'Connecting' ? 'bg-yellow-500' : 'bg-red-500')
+            }
+          />
+          {isOperator && (
+            <button
+              onClick={() => setBrandingOpen(true)}
+              title="Edit relay branding (operator only)"
+              aria-label="Edit relay branding"
+              className="shrink-0 rounded p-1 text-lc-muted hover:bg-lc-card hover:text-lc-white"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <rect x="3" y="3" width="18" height="18" rx="2" />
+                <circle cx="8.5" cy="8.5" r="1.5" />
+                <path d="M21 15l-5-5L5 21" />
+              </svg>
+            </button>
+          )}
+          {isOperator && (
+            <button
+              onClick={() => setLayoutOpen(true)}
+              title="Manage categories & order (relay operator only)"
+              aria-label="Manage categories"
+              className="shrink-0 rounded p-1 text-lc-muted hover:bg-lc-card hover:text-lc-white"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <line x1="3" y1="6" x2="21" y2="6" />
+                <line x1="3" y1="12" x2="21" y2="12" />
+                <line x1="3" y1="18" x2="21" y2="18" />
+              </svg>
+            </button>
+          )}
         </div>
       </div>
 
@@ -361,22 +486,93 @@ function Sidebar({
         {groups.length === 0 && (
           <div className="px-2 py-3 text-xs text-lc-muted">Discovering channels… (kind 39000)</div>
         )}
-        {roots.map((g) => (
-          <GroupNode
-            key={g.id}
-            group={g}
-            depth={0}
-            childrenByParent={childrenByParent}
-            groupsById={groupsById}
-            view={view}
-            onSelect={(id) => setView({ kind: 'group', groupId: id })}
-          />
+        {laidOut.categories.map((cat) => (
+          <CategorySection
+            key={cat.id}
+            name={cat.name}
+            collapsed={!!collapsed[cat.id]}
+            onToggle={() => toggleCollapsed(cat.id)}
+            channelCount={cat.channelIds.length}
+          >
+            {cat.channelIds.map((id) => {
+              const g = groupsById[id];
+              if (!g) return null;
+              return (
+                <GroupNode
+                  key={id}
+                  group={g}
+                  depth={0}
+                  childrenByParent={childrenByParent}
+                  groupsById={groupsById}
+                  view={view}
+                  onSelect={(gid) => setView({ kind: 'group', groupId: gid })}
+                />
+              );
+            })}
+          </CategorySection>
         ))}
+        {laidOut.uncategorized.length > 0 && (
+          laidOut.categories.length > 0 ? (
+            <CategorySection
+              name="Uncategorized"
+              collapsed={!!collapsed['__uncat__']}
+              onToggle={() => toggleCollapsed('__uncat__')}
+              channelCount={laidOut.uncategorized.length}
+            >
+              {laidOut.uncategorized.map((id) => {
+                const g = groupsById[id];
+                if (!g) return null;
+                return (
+                  <GroupNode
+                    key={id}
+                    group={g}
+                    depth={0}
+                    childrenByParent={childrenByParent}
+                    groupsById={groupsById}
+                    view={view}
+                    onSelect={(gid) => setView({ kind: 'group', groupId: gid })}
+                  />
+                );
+              })}
+            </CategorySection>
+          ) : (
+            laidOut.uncategorized.map((id) => {
+              const g = groupsById[id];
+              if (!g) return null;
+              return (
+                <GroupNode
+                  key={id}
+                  group={g}
+                  depth={0}
+                  childrenByParent={childrenByParent}
+                  groupsById={groupsById}
+                  view={view}
+                  onSelect={(gid) => setView({ kind: 'group', groupId: gid })}
+                />
+              );
+            })
+          )
+        )}
       </div>
+      {layoutOpen && relay && (
+        <ManageLayoutModal
+          relayUrl={relay}
+          layout={layout}
+          channels={roots}
+          onClose={() => setLayoutOpen(false)}
+        />
+      )}
+      {brandingOpen && relay && (
+        <RelayBrandingModal
+          relayUrl={relay}
+          branding={branding}
+          onClose={() => setBrandingOpen(false)}
+        />
+      )}
 
       <div className="shrink-0 border-t border-lc-border bg-lc-card/50">
         <VoiceStatusBar />
-        <div className="p-2">
+        <div className="p-2 md:hidden">
           <SidebarMe />
         </div>
       </div>
@@ -499,6 +695,484 @@ function GroupNode({
   );
 }
 
+function CategorySection({
+  name,
+  collapsed,
+  onToggle,
+  channelCount,
+  children,
+}: {
+  name: string;
+  collapsed: boolean;
+  onToggle: () => void;
+  channelCount: number;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="mt-2">
+      <button
+        onClick={onToggle}
+        className="flex w-full items-center gap-1 px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-lc-muted hover:text-lc-white"
+      >
+        <span className="inline-block w-3 text-[8px]">{collapsed ? '▶' : '▼'}</span>
+        <span className="truncate">{name}</span>
+        <span className="ml-auto text-[10px] font-normal opacity-60">{channelCount}</span>
+      </button>
+      {!collapsed && <div>{children}</div>}
+    </div>
+  );
+}
+
+function RelayBrandingModal({
+  relayUrl,
+  branding,
+  onClose,
+}: {
+  relayUrl: string;
+  branding: RelayBranding;
+  onClose: () => void;
+}) {
+  const [icon, setIcon] = useState(branding.icon);
+  const [banner, setBanner] = useState(branding.banner);
+  const [name, setName] = useState(branding.name);
+  const [description, setDescription] = useState(branding.description);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function save() {
+    setSaving(true);
+    setErr(null);
+    try {
+      await publishBranding(relayUrl, {
+        icon: icon.trim(),
+        banner: banner.trim(),
+        name: name.trim(),
+        description: description.trim(),
+        updatedAt: Math.floor(Date.now() / 1000),
+      });
+      onClose();
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={onClose}>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="lc-card flex max-h-[90vh] w-full max-w-lg flex-col overflow-hidden bg-lc-dark"
+      >
+        <header className="flex shrink-0 items-center justify-between border-b border-lc-border px-5 py-3">
+          <div>
+            <div className="text-base font-bold text-lc-white">Relay branding</div>
+            <div className="text-[11px] text-lc-muted">Shown to everyone on {shortHost(relayUrl)} · NIP-78 kind 30078</div>
+          </div>
+          <button onClick={onClose} className="rounded p-1 text-lc-muted hover:bg-lc-card hover:text-lc-white" aria-label="Close">
+            ✕
+          </button>
+        </header>
+        <div className="flex-1 overflow-y-auto p-5 space-y-5">
+          <BlossomImageInput
+            label="Icon"
+            value={icon}
+            onChange={setIcon}
+            shape="square"
+            hint="Square logo shown next to the relay name."
+          />
+          <BlossomImageInput
+            label="Banner"
+            value={banner}
+            onChange={setBanner}
+            shape="wide"
+            hint="Wide image shown above the relay name."
+          />
+          <div>
+            <label className="mb-1.5 block text-xs uppercase tracking-wider text-lc-muted">Display name</label>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder={shortHost(relayUrl)}
+              className={inputClasses}
+            />
+          </div>
+          <div>
+            <label className="mb-1.5 block text-xs uppercase tracking-wider text-lc-muted">Description</label>
+            <textarea
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              rows={2}
+              className={inputClasses}
+            />
+          </div>
+          {err && <p className="text-xs text-red-400">{err}</p>}
+        </div>
+        <footer className="flex shrink-0 items-center justify-end gap-2 border-t border-lc-border px-5 py-3">
+          <button onClick={onClose} className="lc-pill lc-pill-secondary text-xs">Cancel</button>
+          <button
+            onClick={save}
+            disabled={saving}
+            className="rounded-lg bg-lc-green px-4 py-1.5 text-sm font-semibold text-lc-black disabled:opacity-50"
+          >
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function ManageLayoutModal({
+  relayUrl,
+  layout,
+  channels,
+  onClose,
+}: {
+  relayUrl: string;
+  layout: ChannelLayout;
+  channels: ReadonlyArray<JsGroup>;
+  onClose: () => void;
+}) {
+  const [draft, setDraft] = useState<ChannelLayout>(layout);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [newCatName, setNewCatName] = useState('');
+
+  // Whenever the upstream layout changes (e.g. relay echo) refresh the
+  // draft *only* if the user hasn't started editing yet.
+  useEffect(() => {
+    setDraft((d) => (d.updatedAt === 0 ? layout : d));
+  }, [layout]);
+
+  const channelsById = useMemo(
+    () => Object.fromEntries(channels.map((g) => [g.id, g])),
+    [channels],
+  );
+
+  const laidOut = useMemo(
+    () => applyLayout(draft, channels.map((g) => g.id)),
+    [draft, channels],
+  );
+
+  function addCategory() {
+    const name = newCatName.trim();
+    if (!name) return;
+    setDraft((d) => ({
+      ...d,
+      categories: [...d.categories, { id: newCategoryId(), name, position: d.categories.length }],
+    }));
+    setNewCatName('');
+  }
+
+  function renameCategory(id: string, name: string) {
+    setDraft((d) => ({
+      ...d,
+      categories: d.categories.map((c) => (c.id === id ? { ...c, name } : c)),
+    }));
+  }
+
+  function deleteCategory(id: string) {
+    setDraft((d) => ({
+      categories: d.categories.filter((c) => c.id !== id),
+      // Channels in this cat fall back to uncategorized.
+      channels: d.channels.map((ch) =>
+        ch.categoryId === id ? { ...ch, categoryId: null } : ch,
+      ),
+      updatedAt: d.updatedAt,
+    }));
+  }
+
+  function moveCategory(id: string, delta: number) {
+    setDraft((d) => {
+      const arr = [...d.categories];
+      const i = arr.findIndex((c) => c.id === id);
+      const j = i + delta;
+      if (i < 0 || j < 0 || j >= arr.length) return d;
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+      return { ...d, categories: arr.map((c, k) => ({ ...c, position: k })) };
+    });
+  }
+
+  function setChannelCategory(channelId: string, categoryId: string | null) {
+    setDraft((d) => {
+      const others = d.channels.filter((c) => c.id !== channelId);
+      const sameBucket = others.filter((c) => c.categoryId === categoryId);
+      return {
+        ...d,
+        channels: [
+          ...others,
+          { id: channelId, categoryId, position: sameBucket.length },
+        ],
+      };
+    });
+  }
+
+  function moveChannel(channelId: string, delta: number) {
+    setDraft((d) => {
+      const ch = d.channels.find((c) => c.id === channelId);
+      const catId = ch ? ch.categoryId : null;
+      const bucket = laidOut.categories.find((c) => c.id === catId)?.channelIds
+        ?? (catId === null ? laidOut.uncategorized : []);
+      const i = bucket.indexOf(channelId);
+      const j = i + delta;
+      if (i < 0 || j < 0 || j >= bucket.length) return d;
+      const newOrder = [...bucket];
+      [newOrder[i], newOrder[j]] = [newOrder[j], newOrder[i]];
+      const others = d.channels.filter((c) => c.categoryId !== catId);
+      return {
+        ...d,
+        channels: [
+          ...others,
+          ...newOrder.map((id, k) => ({ id, categoryId: catId, position: k })),
+        ],
+      };
+    });
+  }
+
+  async function save() {
+    setSaving(true);
+    setErr(null);
+    try {
+      // Normalize positions before publishing.
+      const normalized: ChannelLayout = {
+        categories: draft.categories.map((c, i) => ({ ...c, position: i })),
+        channels: draft.channels.map((c, i) => ({ ...c, position: i })),
+        updatedAt: Math.floor(Date.now() / 1000),
+      };
+      await publishLayout(relayUrl, normalized);
+      onClose();
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={onClose}>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="lc-card flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden bg-lc-dark"
+      >
+        <header className="flex shrink-0 items-center justify-between border-b border-lc-border px-5 py-3">
+          <div>
+            <div className="text-base font-bold text-lc-white">Categories &amp; order</div>
+            <div className="text-[11px] text-lc-muted">Personal layout for {shortHost(relayUrl)} · NIP-78 kind 30078</div>
+          </div>
+          <button onClick={onClose} className="rounded p-1 text-lc-muted hover:bg-lc-card hover:text-lc-white" aria-label="Close">
+            ✕
+          </button>
+        </header>
+        <div className="flex-1 overflow-y-auto p-5 space-y-6">
+          {/* Add category */}
+          <section className="space-y-2">
+            <div className="text-xs font-bold uppercase tracking-wider text-lc-muted">New category</div>
+            <div className="flex gap-2">
+              <input
+                value={newCatName}
+                onChange={(e) => setNewCatName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    addCategory();
+                  }
+                }}
+                placeholder="e.g. General, Trading, Voice"
+                className={inputClasses + ' flex-1'}
+              />
+              <button
+                type="button"
+                onClick={addCategory}
+                disabled={!newCatName.trim()}
+                className="shrink-0 rounded-lg bg-lc-green px-4 py-1.5 text-sm font-semibold text-lc-black disabled:opacity-50"
+              >
+                Add
+              </button>
+            </div>
+          </section>
+
+          {/* Categories list */}
+          <section className="space-y-3">
+            <div className="text-xs font-bold uppercase tracking-wider text-lc-muted">Categories</div>
+            {laidOut.categories.length === 0 && (
+              <div className="rounded-lg border border-dashed border-lc-border p-3 text-center text-xs text-lc-muted">
+                No categories yet. Add one above to start organizing.
+              </div>
+            )}
+            {laidOut.categories.map((cat, idx) => (
+              <div key={cat.id} className="rounded-xl border border-lc-border bg-lc-black/40 p-3">
+                <div className="flex items-center gap-2">
+                  <input
+                    value={cat.name}
+                    onChange={(e) => renameCategory(cat.id, e.target.value)}
+                    className="flex-1 rounded-lg border border-lc-border bg-lc-black px-2 py-1 text-sm font-semibold text-lc-white outline-none focus:border-lc-green"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => moveCategory(cat.id, -1)}
+                    disabled={idx === 0}
+                    className="rounded p-1 text-lc-muted hover:bg-lc-card hover:text-lc-white disabled:opacity-30"
+                    title="Move up"
+                  >
+                    ▲
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => moveCategory(cat.id, +1)}
+                    disabled={idx === laidOut.categories.length - 1}
+                    className="rounded p-1 text-lc-muted hover:bg-lc-card hover:text-lc-white disabled:opacity-30"
+                    title="Move down"
+                  >
+                    ▼
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => deleteCategory(cat.id)}
+                    className="rounded px-2 py-0.5 text-xs text-red-400 hover:bg-lc-card"
+                    title="Delete category"
+                  >
+                    Delete
+                  </button>
+                </div>
+                <div className="mt-2 space-y-1">
+                  {cat.channelIds.length === 0 ? (
+                    <div className="rounded border border-dashed border-lc-border px-2 py-2 text-center text-[11px] text-lc-muted">
+                      Drop channels here using the dropdown below
+                    </div>
+                  ) : (
+                    cat.channelIds.map((id, i) => (
+                      <ChannelOrderRow
+                        key={id}
+                        channel={channelsById[id]}
+                        bucket={cat.id}
+                        first={i === 0}
+                        last={i === cat.channelIds.length - 1}
+                        categories={laidOut.categories}
+                        onMove={(d) => moveChannel(id, d)}
+                        onChangeCategory={(catId) => setChannelCategory(id, catId)}
+                      />
+                    ))
+                  )}
+                </div>
+              </div>
+            ))}
+          </section>
+
+          {/* Uncategorized channels */}
+          <section className="space-y-2">
+            <div className="text-xs font-bold uppercase tracking-wider text-lc-muted">
+              Uncategorized · {laidOut.uncategorized.length}
+            </div>
+            <div className="space-y-1">
+              {laidOut.uncategorized.length === 0 ? (
+                <div className="rounded border border-dashed border-lc-border px-2 py-2 text-center text-[11px] text-lc-muted">
+                  All channels are placed in categories.
+                </div>
+              ) : (
+                laidOut.uncategorized.map((id, i) => (
+                  <ChannelOrderRow
+                    key={id}
+                    channel={channelsById[id]}
+                    bucket={null}
+                    first={i === 0}
+                    last={i === laidOut.uncategorized.length - 1}
+                    categories={laidOut.categories}
+                    onMove={(d) => moveChannel(id, d)}
+                    onChangeCategory={(catId) => setChannelCategory(id, catId)}
+                  />
+                ))
+              )}
+            </div>
+          </section>
+
+          {err && <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">{err}</div>}
+        </div>
+        <footer className="flex shrink-0 items-center justify-between gap-3 border-t border-lc-border bg-lc-dark px-5 py-3">
+          <div className="text-[11px] text-lc-muted">
+            Saved as a single replaceable kind 30078 event signed by you.
+          </div>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-lg px-4 py-1.5 text-sm font-medium text-lc-muted hover:bg-lc-card hover:text-lc-white"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={save}
+              disabled={saving}
+              className="rounded-lg bg-lc-green px-4 py-1.5 text-sm font-semibold text-lc-black disabled:opacity-50"
+            >
+              {saving ? 'Publishing…' : 'Publish layout'}
+            </button>
+          </div>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function ChannelOrderRow({
+  channel,
+  bucket,
+  first,
+  last,
+  categories,
+  onMove,
+  onChangeCategory,
+}: {
+  channel: JsGroup | undefined;
+  bucket: string | null;
+  first: boolean;
+  last: boolean;
+  categories: ReadonlyArray<{ id: string; name: string }>;
+  onMove: (delta: number) => void;
+  onChangeCategory: (catId: string | null) => void;
+}) {
+  if (!channel) return null;
+  return (
+    <div className="flex items-center gap-2 rounded-lg border border-lc-border bg-lc-black px-2 py-1.5">
+      <span className="text-lc-muted">#</span>
+      <span className="flex-1 truncate text-sm text-lc-white">
+        {channel.name ?? channel.id.slice(0, 12)}
+      </span>
+      <select
+        value={bucket ?? ''}
+        onChange={(e) => onChangeCategory(e.target.value || null)}
+        className="rounded border border-lc-border bg-lc-dark px-1.5 py-0.5 text-xs text-lc-white outline-none focus:border-lc-green"
+      >
+        <option value="">— uncategorized —</option>
+        {categories.map((c) => (
+          <option key={c.id} value={c.id}>
+            {c.name}
+          </option>
+        ))}
+      </select>
+      <button
+        type="button"
+        onClick={() => onMove(-1)}
+        disabled={first}
+        className="rounded p-1 text-lc-muted hover:bg-lc-card hover:text-lc-white disabled:opacity-30"
+        title="Move up"
+      >
+        ▲
+      </button>
+      <button
+        type="button"
+        onClick={() => onMove(+1)}
+        disabled={last}
+        className="rounded p-1 text-lc-muted hover:bg-lc-card hover:text-lc-white disabled:opacity-30"
+        title="Move down"
+      >
+        ▼
+      </button>
+    </div>
+  );
+}
+
 function useMyPubkey(): string | null {
   return useMemo(() => {
     if (typeof window === 'undefined') return null;
@@ -519,13 +1193,13 @@ function SidebarMe() {
   const [editing, setEditing] = useState(false);
   if (!myPubkey) return null;
   return (
-    <div className="relative flex items-center gap-2 px-1">
+    <div className="relative flex w-full items-center gap-2">
       <button
         onClick={() => setOpen((v) => !v)}
-        className="flex min-w-0 flex-1 items-center gap-2 rounded p-1 text-left hover:bg-lc-card"
+        className="flex min-w-0 flex-1 items-center gap-2 rounded text-left hover:bg-lc-card/50"
         title="Account"
       >
-        <Avatar pubkey={myPubkey} size={9} picture={meta?.picture ?? null} />
+        <Avatar pubkey={myPubkey} size={8} picture={meta?.picture ?? null} />
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-semibold text-lc-white">
             {meta?.displayName || meta?.name || 'You'}
@@ -607,6 +1281,8 @@ function ChatPanel({
 }) {
   const messages = useMessages(groupId);
   const reactions = useReactions(groupId);
+  const messageIds = useMemo(() => messages.map((m) => m.id), [messages]);
+  const zapTotals = useMessageZaps(messageIds);
   const groups = useGroups();
   const group = groups.find((g) => g.id === groupId);
   const admins = useAdmins(groupId);
@@ -618,13 +1294,7 @@ function ChatPanel({
   const [replyingTo, setReplyingTo] = useState<JsMessage | null>(null);
   useEffect(() => { setReplyingTo(null); }, [groupId]);
 
-  useEffect(() => {
-    if (!myPubkey || isAdmin) return;
-    const key = `obelisk:auto-claim-admin:${groupId}:${myPubkey}`;
-    if (typeof sessionStorage !== 'undefined' && sessionStorage.getItem(key)) return;
-    try { sessionStorage?.setItem(key, '1'); } catch {}
-    nostrActions.putUser(groupId, myPubkey, ['admin']).catch(() => {});
-  }, [groupId, myPubkey, isAdmin]);
+  // Background admin self-claim is now done across all groups in RelayPanel.
   const scrollRef = useRef<HTMLDivElement>(null);
   const voiceMainRef = useRef<HTMLDivElement>(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -656,6 +1326,70 @@ function ChatPanel({
     onConsumePendingMessageId();
   }, [pendingMessageId, messages, onConsumePendingMessageId]);
 
+  // ── @-mention autocomplete ────────────────────────────────────────────
+  const inputRef = useRef<HTMLInputElement>(null);
+  const memberPubkeys = useMembers(groupId);
+  const [metaMap, setMetaMap] = useState<Record<string, JsUserMetadata>>({});
+  useEffect(() => {
+    let unsub: (() => void) | undefined;
+    void getBridge().then(() => {
+      const impl = getBridgeImpl();
+      if (!impl) return;
+      unsub = impl.userMetadata.subscribe((m) => setMetaMap(m));
+    });
+    return () => { unsub?.(); };
+  }, []);
+  const memberInfos = useMemo<MemberInfo[]>(() => {
+    return memberPubkeys.map((pk) => {
+      const m = metaMap[pk];
+      return {
+        pubkey: pk,
+        displayName: m?.displayName || m?.name || `${pk.slice(0, 8)}…`,
+        picture: m?.picture ?? undefined,
+        lud16: m?.lud16 ?? undefined,
+      };
+    });
+  }, [memberPubkeys, metaMap]);
+  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const filteredMembers = useMemo(
+    () => (mentionQuery === null ? [] : filterMembers(memberInfos, mentionQuery).slice(0, 8)),
+    [memberInfos, mentionQuery],
+  );
+  function detectMention(value: string, cursor: number) {
+    const before = value.slice(0, cursor);
+    const m = before.match(/(?:^|\s)@(\w*)$/);
+    if (m) {
+      setMentionQuery(m[1]);
+      setMentionIndex(0);
+    } else {
+      setMentionQuery(null);
+    }
+  }
+  function applyMention(member: MemberInfo) {
+    const ta = inputRef.current;
+    if (!ta) return;
+    const cursor = ta.selectionStart ?? draft.length;
+    const before = draft.slice(0, cursor);
+    const after = draft.slice(cursor);
+    const replaced = before.replace(/@(\w*)$/, () => `nostr:${nip19.npubEncode(member.pubkey)} `);
+    const next = replaced + after;
+    setDraft(next);
+    setMentionQuery(null);
+    requestAnimationFrame(() => {
+      const pos = replaced.length;
+      ta.focus();
+      ta.setSelectionRange(pos, pos);
+    });
+  }
+  function onMentionKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (mentionQuery === null || filteredMembers.length === 0) return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); setMentionIndex((i) => (i + 1) % filteredMembers.length); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setMentionIndex((i) => (i - 1 + filteredMembers.length) % filteredMembers.length); }
+    else if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); applyMention(filteredMembers[mentionIndex]); }
+    else if (e.key === 'Escape') { e.preventDefault(); setMentionQuery(null); }
+  }
+
   const [uploadingMedia, setUploadingMedia] = useState(false);
   async function onPickFile(file: File) {
     setUploadingMedia(true);
@@ -678,6 +1412,23 @@ function ChatPanel({
     e.preventDefault();
     const content = draft.trim();
     if (!content) return;
+
+    // /zap [user] [amount] — frontend-only.
+    //   /zap                → reply target (or last channel msg from someone else)
+    //   /zap 100            → same target, with amount preset
+    //   /zap <npub|hex|@name> [amount] → target that channel member
+    if (/^\/zap(\s|$)/.test(content)) {
+      const parsed = parseZapCommand(content, groupId, messages, myPubkey, replyingTo);
+      if (!parsed.ok) {
+        setSendError(parsed.error);
+        return;
+      }
+      useMessageZapStore.getState().open(parsed.target);
+      setDraft('');
+      setReplyingTo(null);
+      return;
+    }
+
     setSending(true);
     setSendError(null);
     try {
@@ -715,15 +1466,15 @@ function ChatPanel({
             {group?.about && <div className="truncate text-xs text-lc-muted">{group.about}</div>}
           </div>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-2">
           {isAdmin && (
             <button
               onClick={() => setShowSettings(true)}
-              className="rounded p-1.5 text-lc-muted hover:bg-lc-card hover:text-lc-white"
+              className="rounded-md p-2 text-lc-muted hover:bg-lc-card hover:text-lc-white"
               title="Channel settings"
               aria-label="Channel settings"
             >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <circle cx="12" cy="12" r="3" />
                 <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z" />
               </svg>
@@ -732,14 +1483,14 @@ function ChatPanel({
           <button
             onClick={onToggleMembers}
             className={
-              'rounded p-1.5 hover:bg-lc-card ' +
+              'rounded-md p-2 hover:bg-lc-card ' +
               (showMembers ? 'text-lc-green' : 'text-lc-muted hover:text-lc-white')
             }
             title={showMembers ? 'Hide member list' : 'Show member list'}
             aria-label={showMembers ? 'Hide member list' : 'Show member list'}
             aria-pressed={showMembers}
           >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
               <circle cx="9" cy="7" r="4" />
               <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
@@ -795,6 +1546,7 @@ function ChatPanel({
                 msg={m}
                 allMessages={messages}
                 reactions={reactions[m.id] ?? []}
+                zapTotal={zapTotals.get(m.id) ?? null}
                 groupId={groupId}
                 grouped={!!grouped}
                 isAdmin={isAdmin}
@@ -805,7 +1557,7 @@ function ChatPanel({
         )}
       </div>
 
-      <form onSubmit={onSend} className="shrink-0 px-5 pb-5">
+      <form onSubmit={onSend} className="shrink-0 px-5 pt-3 pb-3">
         {replyingTo && (
           <div className="mb-2 flex items-center justify-between gap-2 rounded-t-md border border-b-0 border-lc-border bg-lc-card/60 px-3 py-1.5 text-xs text-lc-muted">
             <span className="truncate">
@@ -825,7 +1577,7 @@ function ChatPanel({
         {sendError && (
           <p className="mb-2 break-words text-xs text-red-400">{sendError}</p>
         )}
-        <div className="flex items-center gap-2 rounded-lg border border-lc-border bg-lc-card px-4 py-2 focus-within:border-lc-green">
+        <div className="flex min-h-[3.5rem] items-center gap-2 rounded-xl border border-lc-border bg-lc-card px-4 focus-within:border-lc-green">
           <label
             className="cursor-pointer text-lc-muted hover:text-lc-white"
             title="Attach media"
@@ -850,13 +1602,33 @@ function ChatPanel({
               }}
             />
           </label>
-          <input
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            placeholder={`Message #${group?.name ?? groupId.slice(0, 8)}`}
-            disabled={sending}
-            className="flex-1 bg-transparent text-sm text-lc-white outline-none placeholder:text-lc-muted disabled:opacity-50"
-          />
+          <div className="relative flex-1">
+            {mentionQuery !== null && filteredMembers.length > 0 && (
+              <MentionAutocomplete
+                members={filteredMembers}
+                selectedIndex={mentionIndex}
+                onSelect={applyMention}
+                onHover={setMentionIndex}
+                onClose={() => setMentionQuery(null)}
+              />
+            )}
+            <input
+              ref={inputRef}
+              value={draft}
+              onChange={(e) => {
+                setDraft(e.target.value);
+                detectMention(e.target.value, e.target.selectionStart ?? e.target.value.length);
+              }}
+              onKeyDown={onMentionKeyDown}
+              onSelect={(e) => {
+                const t = e.currentTarget;
+                detectMention(t.value, t.selectionStart ?? t.value.length);
+              }}
+              placeholder={`Message #${group?.name ?? groupId.slice(0, 8)}`}
+              disabled={sending}
+              className="w-full bg-transparent text-sm text-lc-white outline-none placeholder:text-lc-muted disabled:opacity-50"
+            />
+          </div>
           <button
             type="submit"
             disabled={sending || !draft.trim() || uploadingMedia}
@@ -935,18 +1707,18 @@ function CopyInviteLinkButton({ groupId }: { groupId: string }) {
     <button
       onClick={onCopy}
       className={
-        'rounded p-1.5 hover:bg-lc-card hover:text-lc-white ' +
+        'rounded-md p-2 hover:bg-lc-card hover:text-lc-white ' +
         (copied ? 'text-lc-green' : 'text-lc-muted')
       }
       title={copied ? 'Link copied — only members of this relay can open it' : 'Copy invite link'}
       aria-label="Copy invite link"
     >
       {copied ? (
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
           <polyline points="20 6 9 17 4 12" />
         </svg>
       ) : (
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
           <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
         </svg>
@@ -989,6 +1761,7 @@ function MessageRow({
   msg,
   allMessages,
   reactions,
+  zapTotal,
   groupId,
   grouped,
   isAdmin,
@@ -997,6 +1770,7 @@ function MessageRow({
   msg: JsMessage;
   allMessages: ReadonlyArray<JsMessage>;
   reactions: ReadonlyArray<{ emoji: string }>;
+  zapTotal: MessageZapTotal | null;
   groupId: string;
   grouped: boolean;
   isAdmin: boolean;
@@ -1015,8 +1789,27 @@ function MessageRow({
     }
   };
   const meta = useUserMetadata(msg.pubkey);
-  const [showPicker, setShowPicker] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [panelPinned, setPanelPinned] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement | null>(null);
   const myPubkey = useMyPubkey();
+  const isMuted = useModerationStore((s) => s.mutedPubkeys.includes(msg.pubkey));
+  const toggleMute = useModerationStore((s) => s.toggleMute);
+  const closeAll = () => { setMenuOpen(false); setPanelPinned(false); setPickerOpen(false); };
+  useEffect(() => {
+    if (!menuOpen && !panelPinned && !pickerOpen) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) closeAll();
+    };
+    const onEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') closeAll(); };
+    document.addEventListener('mousedown', onDocClick);
+    document.addEventListener('keydown', onEsc);
+    return () => {
+      document.removeEventListener('mousedown', onDocClick);
+      document.removeEventListener('keydown', onEsc);
+    };
+  }, [menuOpen, panelPinned, pickerOpen]);
   // Dedupe reactions by (pubkey, emoji) — each user can only count once per
   // emoji even if the relay re-delivered or the user double-tapped before the
   // first kind:7 round-tripped.
@@ -1044,6 +1837,20 @@ function MessageRow({
   const onReactionClick = (emoji: string) => {
     if (myReactedEmojis.has(emoji)) return; // already reacted — no-op until retraction is wired
     void nostrActions.sendReaction(msg.id, msg.pubkey, emoji, groupId);
+  };
+  const openZap = useMessageZapStore((s) => s.open);
+  const onZapClick = () => {
+    if (msg.pubkey === myPubkey) {
+      useToastStore.getState().pushToast({ title: '⚠️ Cannot zap yourself', body: '' });
+      return;
+    }
+    openZap({
+      messageId: msg.id,
+      recipientPubkey: msg.pubkey,
+      recipientLud16: meta?.lud16 ?? null,
+      displayName: meta?.displayName || meta?.name || msg.pubkey.slice(0, 8),
+      groupId,
+    });
   };
   const [anchor, setAnchor] = useState<{ x: number; y: number; placement?: 'top' | 'bottom' } | null>(null);
   const displayName = meta?.displayName || meta?.name || msg.pubkey.slice(0, 8);
@@ -1079,11 +1886,32 @@ function MessageRow({
         {msg.replyToId && !parent && (
           <div className="mb-1 text-xs italic text-lc-muted">↩ replying to a message</div>
         )}
-        <div className="break-words text-sm text-lc-white">
+        <div
+          className="break-words text-sm text-lc-white cursor-pointer"
+          onClick={(e) => {
+            // Don't hijack clicks on links/buttons inside the message content.
+            const t = e.target as HTMLElement;
+            if (t.closest('a, button, input, textarea, [data-no-msg-menu]')) return;
+            setPanelPinned((v) => !v);
+          }}
+        >
           <MessageContent content={msg.content} messageId={msg.id} channelId={groupId} />
         </div>
-        {counts.length > 0 && (
+        {(counts.length > 0 || (zapTotal && zapTotal.totalSats > 0)) && (
           <div className="mt-1 flex flex-wrap gap-1">
+            {zapTotal && zapTotal.totalSats > 0 && (
+              <button
+                onClick={onZapClick}
+                disabled={msg.pubkey === myPubkey}
+                title={`${zapTotal.count} zap${zapTotal.count === 1 ? '' : 's'} from ${zapTotal.zappers.size} ${zapTotal.zappers.size === 1 ? 'person' : 'people'}`}
+                className="inline-flex items-center gap-1 rounded-full border border-yellow-500/40 bg-yellow-500/10 px-2 py-0.5 text-xs text-yellow-200 hover:border-yellow-500 disabled:opacity-50"
+              >
+                <svg viewBox="0 0 24 24" fill="currentColor" width="11" height="11" aria-hidden="true">
+                  <path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z" />
+                </svg>
+                {zapTotal.totalSats.toLocaleString()}
+              </button>
+            )}
             {counts.map(([emoji, n]) => {
               const mine = myReactedEmojis.has(emoji);
               return (
@@ -1106,66 +1934,129 @@ function MessageRow({
           </div>
         )}
       </div>
-      <div className="absolute right-3 top-0 hidden gap-0.5 rounded-md border border-lc-border bg-lc-dark p-0.5 shadow-md group-hover:flex">
-        <button
-          onClick={() => onReply(msg)}
-          className="rounded px-1.5 py-0.5 text-xs text-lc-muted hover:bg-lc-card hover:text-lc-white"
-          title="Reply"
+      <div ref={menuRef} className="absolute right-3 top-0 flex items-start gap-1" data-no-msg-menu>
+        {/* Frequent emoji panel — visible on hover, click to pin */}
+        <div
+          className={
+            'rounded-md border border-lc-border bg-lc-dark p-0.5 shadow-md ' +
+            (panelPinned || pickerOpen ? 'flex' : 'hidden group-hover:flex')
+          }
         >
-          ↩
-        </button>
+          {QUICK_REACTIONS.map((e) => {
+            const mine = myReactedEmojis.has(e);
+            return (
+              <button
+                key={e}
+                onClick={() => { onReactionClick(e); closeAll(); }}
+                disabled={mine}
+                className="rounded px-1.5 py-0.5 text-sm hover:bg-lc-card disabled:opacity-40 disabled:cursor-default"
+                title={mine ? 'Already reacted' : `React ${e}`}
+              >
+                {e}
+              </button>
+            );
+          })}
+          <button
+            onClick={() => { setPickerOpen((v) => !v); setPanelPinned(true); }}
+            className="rounded px-1.5 py-0.5 text-sm text-lc-muted hover:bg-lc-card hover:text-lc-white"
+            title="More emojis…"
+            aria-label="Open emoji picker"
+          >
+            ➕
+          </button>
+        </div>
+        {/* ⋯ menu trigger */}
         <button
-          onClick={() => {
-            if (typeof window === 'undefined') return;
-            const url = new URL(window.location.href);
-            url.search = '';
-            url.searchParams.set('c', groupId);
-            url.searchParams.set('m', msg.id);
-            navigator.clipboard.writeText(url.toString());
-          }}
-          className="rounded px-1.5 py-0.5 text-xs text-lc-muted hover:bg-lc-card hover:text-lc-white"
-          title="Copy message link"
+          onClick={(e) => { e.stopPropagation(); setMenuOpen((v) => !v); setPickerOpen(false); }}
+          className={
+            'rounded-md border border-lc-border bg-lc-dark px-2 py-0.5 text-sm text-lc-muted shadow-md hover:bg-lc-card hover:text-lc-white ' +
+            (menuOpen || panelPinned ? 'flex' : 'hidden group-hover:flex')
+          }
+          title="More actions"
+          aria-label="More actions"
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
         >
-          🔗
+          ⋯
         </button>
-        {QUICK_REACTIONS.map((e) => (
-          <button
-            key={e}
-            onClick={() => onReactionClick(e)}
-            className="rounded px-1.5 py-0.5 text-sm hover:bg-lc-card"
-            title={`React ${e}`}
+        {menuOpen && (
+          <div
+            role="menu"
+            className="absolute right-0 top-7 z-20 w-48 rounded-md border border-lc-border bg-lc-dark p-1 shadow-2xl"
           >
-            {e}
-          </button>
-        ))}
-        {isAdmin && (
-          <button
-            onClick={() => {
-              if (confirm('Delete this message?')) nostrActions.deleteGroupEvent(groupId, msg.id);
-            }}
-            className="rounded px-1.5 py-0.5 text-xs text-red-400 hover:bg-lc-card"
-            title="Delete (admin)"
-          >
-            🗑
-          </button>
+            <button
+              role="menuitem"
+              onClick={() => { onReply(msg); setMenuOpen(false); }}
+              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-lc-white hover:bg-lc-card"
+            >
+              <span className="w-4 text-center">↩</span> Reply
+            </button>
+            <button
+              role="menuitem"
+              onClick={() => { setMenuOpen(false); setPickerOpen(true); setPanelPinned(true); }}
+              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-lc-white hover:bg-lc-card"
+            >
+              <span className="w-4 text-center">😊</span> React
+            </button>
+            <button
+              role="menuitem"
+              onClick={() => { onZapClick(); setMenuOpen(false); }}
+              disabled={msg.pubkey === myPubkey}
+              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-yellow-400 hover:bg-lc-card disabled:opacity-40 disabled:hover:bg-transparent"
+            >
+              <svg viewBox="0 0 24 24" fill="currentColor" width="12" height="12" aria-hidden="true" className="ml-0.5">
+                <path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z" />
+              </svg>
+              Zap
+            </button>
+            <button
+              role="menuitem"
+              onClick={() => {
+                if (typeof window !== 'undefined') {
+                  const url = new URL(window.location.href);
+                  url.search = '';
+                  url.searchParams.set('c', groupId);
+                  url.searchParams.set('m', msg.id);
+                  navigator.clipboard.writeText(url.toString());
+                  useToastStore.getState().pushToast({ title: '🔗 Link copied', body: '' });
+                }
+                setMenuOpen(false);
+              }}
+              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-lc-white hover:bg-lc-card"
+            >
+              <span className="w-4 text-center">🔗</span> Copy link
+            </button>
+            <button
+              role="menuitem"
+              onClick={() => { toggleMute(msg.pubkey); setMenuOpen(false); }}
+              disabled={msg.pubkey === myPubkey}
+              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-red-400 hover:bg-lc-card disabled:opacity-40 disabled:hover:bg-transparent"
+            >
+              <span className="w-4 text-center">🔕</span>
+              {isMuted ? 'Unmute user' : 'Mute user'}
+            </button>
+            {isAdmin && (
+              <button
+                role="menuitem"
+                onClick={() => {
+                  if (confirm('Delete this message?')) nostrActions.deleteGroupEvent(groupId, msg.id);
+                  setMenuOpen(false);
+                }}
+                className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-red-400 hover:bg-lc-card"
+              >
+                <span className="w-4 text-center">🗑</span> Delete (admin)
+              </button>
+            )}
+          </div>
+        )}
+        {pickerOpen && (
+          <EmojiPicker
+            disabledEmojis={myReactedEmojis}
+            onPick={(e) => { onReactionClick(e); closeAll(); }}
+            onClose={() => setPickerOpen(false)}
+          />
         )}
       </div>
-      {showPicker && (
-        <div className="absolute right-3 top-8 flex gap-1 rounded border border-lc-border bg-lc-dark p-1 shadow-2xl">
-          {QUICK_REACTIONS.map((e) => (
-            <button
-              key={e}
-              onClick={() => {
-                onReactionClick(e);
-                setShowPicker(false);
-              }}
-              className="rounded p-1 hover:bg-lc-card"
-            >
-              {e}
-            </button>
-          ))}
-        </div>
-      )}
       {anchor && (
         <UserPanel
           pubkey={msg.pubkey}
@@ -1175,6 +2066,96 @@ function MessageRow({
           anchor={anchor}
         />
       )}
+    </div>
+  );
+}
+
+// -- Emoji picker -------------------------------------------------------
+
+function EmojiPicker({
+  onPick,
+  onClose,
+  disabledEmojis,
+}: {
+  onPick: (emoji: string) => void;
+  onClose: () => void;
+  disabledEmojis: Set<string>;
+}) {
+  const [query, setQuery] = useState('');
+  const q = normalizeEmojiKeyword(query.trim());
+  const filtered = useMemo(() => {
+    if (!q) return null;
+    return SEARCHABLE_EMOJI.filter((e) => e.haystack.includes(q)).slice(0, 64);
+  }, [q]);
+  return (
+    <div
+      role="dialog"
+      aria-label="Emoji picker"
+      className="absolute right-0 top-7 z-30 w-72 rounded-md border border-lc-border bg-lc-dark p-2 shadow-2xl"
+      onClick={(e) => e.stopPropagation()}
+    >
+      <div className="mb-2 flex items-center gap-2">
+        <input
+          autoFocus
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search emoji…"
+          className="flex-1 rounded border border-lc-border bg-lc-black px-2 py-1 text-xs text-lc-white placeholder:text-lc-muted focus:border-lc-green focus:outline-none"
+        />
+        <button
+          onClick={onClose}
+          className="rounded p-1 text-lc-muted hover:bg-lc-card hover:text-lc-white"
+          aria-label="Close emoji picker"
+          title="Close"
+        >
+          ✕
+        </button>
+      </div>
+      <div className="max-h-64 overflow-y-auto">
+        {filtered ? (
+          <div className="grid grid-cols-8 gap-0.5">
+            {filtered.length === 0 && (
+              <div className="col-span-8 py-4 text-center text-xs text-lc-muted">No matches</div>
+            )}
+            {filtered.map((e) => {
+              const mine = disabledEmojis.has(e.char);
+              return (
+                <button
+                  key={e.char}
+                  onClick={() => onPick(e.char)}
+                  disabled={mine}
+                  className="rounded p-1 text-lg hover:bg-lc-card disabled:opacity-40 disabled:cursor-default"
+                  title={mine ? 'Already reacted' : e.keywords[0]}
+                >
+                  {e.char}
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          EMOJI_CATEGORY_NAMES.map((cat) => (
+            <div key={cat} className="mb-2">
+              <div className="mb-1 px-1 text-[10px] font-bold uppercase tracking-wider text-lc-muted">{cat}</div>
+              <div className="grid grid-cols-8 gap-0.5">
+                {EMOJI_CATEGORIES[cat].map((e) => {
+                  const mine = disabledEmojis.has(e.char);
+                  return (
+                    <button
+                      key={e.char}
+                      onClick={() => onPick(e.char)}
+                      disabled={mine}
+                      className="rounded p-1 text-lg hover:bg-lc-card disabled:opacity-40 disabled:cursor-default"
+                      title={mine ? 'Already reacted' : e.keywords[0]}
+                    >
+                      {e.char}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ))
+        )}
+      </div>
     </div>
   );
 }
@@ -1403,184 +2384,286 @@ function ChannelSettingsModal({ group, onClose }: { group: JsGroup; onClose: () 
             ✕
           </button>
         </header>
-        <div className="flex-1 overflow-y-auto p-5">
-          <form onSubmit={saveMeta} className="space-y-3">
-            <div className="text-xs font-bold uppercase tracking-wider text-lc-muted">Metadata (NIP-29 kind 9002)</div>
-            <Field label="Name">
-              <input value={name} onChange={(e) => setName(e.target.value)} className={inputClasses} />
-            </Field>
-            <Field label="About">
-              <textarea value={about} onChange={(e) => setAbout(e.target.value)} rows={2} className={inputClasses} />
-            </Field>
-            <div>
-              <label className="block text-xs text-lc-muted mb-1.5 uppercase tracking-wider">Icon</label>
-              <div className="flex items-center gap-3">
-                {picture ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img
-                    src={picture}
-                    alt="Icon preview"
-                    className="w-12 h-12 rounded-lg object-cover bg-lc-black border border-lc-border"
-                  />
-                ) : (
-                  <div className="w-12 h-12 rounded-lg bg-lc-black border border-lc-border" />
-                )}
-                <input
-                  name="picture"
-                  value={picture}
-                  onChange={(e) => setPicture(e.target.value)}
-                  placeholder="https://… or upload"
-                  className="flex-1 px-3 py-2 rounded-lg bg-lc-black border border-lc-border text-lc-white text-sm focus:border-lc-green focus:outline-none transition-colors"
+        <div className="flex-1 overflow-y-auto">
+          <form onSubmit={saveMeta} id="channel-meta-form" className="space-y-7 p-5">
+            {/* Basics --------------------------------------------------- */}
+            <section className="space-y-3">
+              <SectionHeader title="Basics" />
+              <Field label="Name">
+                <input value={name} onChange={(e) => setName(e.target.value)} className={inputClasses} />
+              </Field>
+              <Field label="About">
+                <textarea
+                  value={about}
+                  onChange={(e) => setAbout(e.target.value)}
+                  rows={2}
+                  placeholder="What's this channel about?"
+                  className={inputClasses}
                 />
-                <label className="lc-pill lc-pill-secondary text-xs cursor-pointer whitespace-nowrap">
-                  {uploading === 'icon' ? 'Uploading…' : 'Upload'}
-                  <input
-                    type="file"
-                    accept="image/*"
-                    className="hidden"
-                    disabled={uploading === 'icon'}
-                    onChange={(e) => {
-                      const f = e.target.files?.[0];
-                      if (f) void uploadImage(f, 'icon');
-                      e.target.value = '';
-                    }}
-                  />
-                </label>
-              </div>
-            </div>
-            <div>
-              <label className="block text-xs text-lc-muted mb-1.5 uppercase tracking-wider">Banner</label>
-              <div className="flex items-center gap-3">
-                {banner ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img
-                    src={banner}
-                    alt="Banner preview"
-                    className="w-24 h-12 rounded-lg object-cover bg-lc-black border border-lc-border"
-                  />
-                ) : (
-                  <div className="w-24 h-12 rounded-lg bg-lc-black border border-lc-border" />
-                )}
-                <input
-                  name="banner"
-                  value={banner}
-                  onChange={(e) => setBanner(e.target.value)}
-                  placeholder="https://… or upload (gif / png / jpg)"
-                  className="flex-1 px-3 py-2 rounded-lg bg-lc-black border border-lc-border text-lc-white text-sm focus:border-lc-green focus:outline-none transition-colors"
+              </Field>
+            </section>
+
+            {/* Appearance ----------------------------------------------- */}
+            <section className="space-y-4">
+              <SectionHeader title="Appearance" />
+              <ImageUploadRow
+                label="Icon"
+                value={picture}
+                onChange={setPicture}
+                onUpload={(f) => uploadImage(f, 'icon')}
+                uploading={uploading === 'icon'}
+                previewClass="w-14 h-14 rounded-xl"
+                placeholder="https://… or upload"
+              />
+              <ImageUploadRow
+                label="Banner"
+                value={banner}
+                onChange={setBanner}
+                onUpload={(f) => uploadImage(f, 'banner')}
+                uploading={uploading === 'banner'}
+                previewClass="w-28 h-14 rounded-lg"
+                placeholder="https://… or upload (gif / png / jpg)"
+              />
+              {uploadError && <p className="text-xs text-red-400">{uploadError}</p>}
+            </section>
+
+            {/* Access --------------------------------------------------- */}
+            <section className="space-y-3">
+              <SectionHeader title="Access" hint="Who can read and join" />
+              <div className="grid gap-2 sm:grid-cols-2">
+                <ToggleCard
+                  active={isPublic}
+                  onClick={() => setIsPublic(!isPublic)}
+                  icon="🌐"
+                  title="Public"
+                  subtitle={isPublic ? 'Readable without joining' : 'Members only can read'}
                 />
-                <label className="lc-pill lc-pill-secondary text-xs cursor-pointer whitespace-nowrap">
-                  {uploading === 'banner' ? 'Uploading…' : 'Upload'}
-                  <input
-                    type="file"
-                    accept="image/*"
-                    className="hidden"
-                    disabled={uploading === 'banner'}
-                    onChange={(e) => {
-                      const f = e.target.files?.[0];
-                      if (f) void uploadImage(f, 'banner');
-                      e.target.value = '';
-                    }}
-                  />
-                </label>
+                <ToggleCard
+                  active={isOpen}
+                  onClick={() => setIsOpen(!isOpen)}
+                  icon={isOpen ? '🟢' : '🔒'}
+                  title="Open"
+                  subtitle={isOpen ? 'Anyone can join' : 'Invite-only'}
+                />
               </div>
-              {uploadError && (
-                <p className="mt-1.5 text-xs text-red-400">{uploadError}</p>
+              {isPublic && isOpen && (
+                <div className="flex items-start gap-2 rounded-lg border border-lc-green/30 bg-lc-green/5 px-3 py-2 text-xs text-lc-white/90">
+                  <span className="text-base leading-none">✨</span>
+                  <div>
+                    <div className="font-semibold text-lc-green">Relay-whitelisted users have full access</div>
+                    <div className="mt-0.5 text-lc-muted">
+                      With <b>Public + Open</b>, anyone the relay already accepts can read and post here — no need to add them as members manually. The relay&apos;s whitelist is the only gate.
+                    </div>
+                  </div>
+                </div>
               )}
-              <p className="mt-1.5 text-[11px] text-lc-muted">
-                Stored as a <code className="text-lc-white/80">[&quot;banner&quot;, url]</code> tag on NIP-29 kind 9002. The relay just preserves and replays it on kind 39000 — no relay change needed. See <code className="text-lc-white/80">docs/server-banner.md</code>.
-              </p>
-            </div>
-            <div className="flex gap-4">
-              <label className="flex items-center gap-2 text-sm text-lc-white">
-                <input type="checkbox" checked={isPublic} onChange={(e) => setIsPublic(e.target.checked)} />
-                Public (readable without joining)
-              </label>
-              <label className="flex items-center gap-2 text-sm text-lc-white">
-                <input type="checkbox" checked={isOpen} onChange={(e) => setIsOpen(e.target.checked)} />
-                Open (anyone can join)
-              </label>
-            </div>
-            <div>
-              <label className="block text-xs text-lc-muted mb-1.5 uppercase tracking-wider">Channel type</label>
-              <div className="flex gap-2">
-                <button
-                  type="button"
+              {!isPublic && !isOpen && (
+                <p className="text-[11px] text-lc-muted">
+                  Strictest mode: only members listed below can read or post.
+                </p>
+              )}
+            </section>
+
+            {/* Channel type --------------------------------------------- */}
+            <section className="space-y-3">
+              <SectionHeader title="Channel type" />
+              <div className="grid gap-2 sm:grid-cols-2">
+                <ToggleCard
+                  active={channelKind === 'text'}
                   onClick={() => setChannelKind('text')}
-                  className={
-                    'lc-pill text-xs ' +
-                    (channelKind === 'text' ? 'lc-pill-primary' : 'lc-pill-secondary')
-                  }
-                >
-                  Text
-                </button>
-                <button
-                  type="button"
+                  icon="💬"
+                  title="Text"
+                  subtitle="Messages, threads, reactions"
+                />
+                <ToggleCard
+                  active={channelKind === 'voice'}
                   onClick={() => setChannelKind('voice')}
-                  className={
-                    'lc-pill text-xs ' +
-                    (channelKind === 'voice' ? 'lc-pill-primary' : 'lc-pill-secondary')
-                  }
-                >
-                  Voice / Video
-                </button>
+                  icon="🎙️"
+                  title="Voice / Video"
+                  subtitle="P2P call, up to 4 people"
+                />
               </div>
-              <p className="mt-1.5 text-[11px] text-lc-muted">
-                A voice channel adds a <code className="text-lc-white/80">[&quot;t&quot;,&quot;voice&quot;]</code> tag to the kind 9002 metadata. Members open <code className="text-lc-white/80">/voice/{group.id.slice(0, 8)}…</code> to join the call. Up to 4 participants, P2P over WebRTC. See <code className="text-lc-white/80">docs/webrtc-p2p-nostr-signaling.md</code>.
-              </p>
-            </div>
-            {metaErr && <div className="text-sm text-red-400">{metaErr}</div>}
-            <div className="flex justify-end">
-              <button
-                type="submit"
-                disabled={savingMeta}
-                className="rounded bg-lc-green px-4 py-1.5 text-sm font-semibold text-lc-black disabled:opacity-50"
-              >
-                {savingMeta ? 'Saving…' : 'Save metadata'}
-              </button>
-            </div>
+              {channelKind === 'voice' && (
+                <p className="text-[11px] text-lc-muted">
+                  Adds a <code className="text-lc-white/80">[&quot;t&quot;,&quot;voice&quot;]</code> tag. Members open{' '}
+                  <code className="text-lc-white/80">/voice/{group.id.slice(0, 8)}…</code> to join.
+                </p>
+              )}
+            </section>
+
+            {metaErr && (
+              <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">{metaErr}</div>
+            )}
           </form>
 
-          <hr className="my-6 border-lc-border" />
+          <div className="border-t border-lc-border" />
 
-          <div className="space-y-3">
-            <div className="text-xs font-bold uppercase tracking-wider text-lc-muted">Add member (NIP-29 kind 9000)</div>
-            <form onSubmit={addMember} className="flex gap-2">
+          <section className="space-y-3 p-5">
+            <div className="flex items-center justify-between">
+              <SectionHeader title="Members" hint="NIP-29 kind 9000 / 9001" />
+              <span className="rounded-full bg-lc-card px-2 py-0.5 text-[11px] font-semibold text-lc-muted">
+                {members.length}
+              </span>
+            </div>
+            <form onSubmit={addMember} className="flex flex-wrap items-center gap-2">
               <input
                 value={newMember}
                 onChange={(e) => setNewMember(e.target.value)}
                 placeholder="npub1… or hex pubkey"
                 spellCheck={false}
-                className={inputClasses}
+                className={inputClasses + ' flex-1 min-w-[12rem]'}
               />
-              <label className="flex items-center gap-1 whitespace-nowrap text-xs text-lc-muted">
+              <label className="flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-lc-border bg-lc-black px-2.5 py-1.5 text-xs text-lc-muted">
                 <input type="checkbox" checked={makeAdmin} onChange={(e) => setMakeAdmin(e.target.checked)} />
                 admin
               </label>
               <button
                 type="submit"
                 disabled={memberBusy || !newMember.trim()}
-                className="shrink-0 rounded bg-lc-green px-3 py-1.5 text-sm font-semibold text-lc-black disabled:opacity-50"
+                className="shrink-0 rounded-lg bg-lc-green px-4 py-1.5 text-sm font-semibold text-lc-black disabled:opacity-50"
               >
                 {memberBusy ? '…' : 'Add'}
               </button>
             </form>
             {memberErr && <div className="text-sm text-red-400">{memberErr}</div>}
-
-            <div className="mt-4 text-xs font-bold uppercase tracking-wider text-lc-muted">
-              Current members · {members.length}
-            </div>
             <div className="space-y-1 max-h-64 overflow-y-auto">
               {members.map((pk) => (
                 <ManageMemberRow key={pk} groupId={group.id} pubkey={pk} isAdmin={adminSet.has(pk)} />
               ))}
               {members.length === 0 && (
-                <div className="text-xs text-lc-muted">
-                  No members yet — relay hasn&apos;t published kind 39002 for this group, or only the creator is in it.
+                <div className="rounded-lg border border-dashed border-lc-border px-3 py-4 text-center text-xs text-lc-muted">
+                  No members yet. {isPublic && isOpen
+                    ? 'Not required — relay whitelist controls access.'
+                    : 'Add at least one to grant access.'}
                 </div>
               )}
             </div>
-          </div>
+          </section>
         </div>
+        <footer className="flex shrink-0 items-center justify-between gap-3 border-t border-lc-border bg-lc-dark px-5 py-3">
+          <div className="text-[11px] text-lc-muted">Changes publish as NIP-29 kind 9002.</div>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-lg px-4 py-1.5 text-sm font-medium text-lc-muted hover:bg-lc-card hover:text-lc-white"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              form="channel-meta-form"
+              disabled={savingMeta}
+              className="rounded-lg bg-lc-green px-4 py-1.5 text-sm font-semibold text-lc-black disabled:opacity-50"
+            >
+              {savingMeta ? 'Saving…' : 'Save changes'}
+            </button>
+          </div>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function SectionHeader({ title, hint }: { title: string; hint?: string }) {
+  return (
+    <div className="flex items-baseline justify-between">
+      <h3 className="text-sm font-bold text-lc-white">{title}</h3>
+      {hint && <span className="text-[11px] text-lc-muted">{hint}</span>}
+    </div>
+  );
+}
+
+function ToggleCard({
+  active,
+  onClick,
+  icon,
+  title,
+  subtitle,
+}: {
+  active: boolean;
+  onClick: () => void;
+  icon: string;
+  title: string;
+  subtitle: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={
+        'flex items-start gap-3 rounded-xl border px-3 py-2.5 text-left transition-colors ' +
+        (active
+          ? 'border-lc-green bg-lc-green/10 text-lc-white'
+          : 'border-lc-border bg-lc-black hover:border-lc-muted text-lc-white/80')
+      }
+    >
+      <div className="text-xl leading-none">{icon}</div>
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-semibold">{title}</div>
+        <div className="text-[11px] text-lc-muted">{subtitle}</div>
+      </div>
+      <div
+        className={
+          'mt-0.5 h-4 w-4 shrink-0 rounded-full border ' +
+          (active ? 'border-lc-green bg-lc-green' : 'border-lc-border')
+        }
+      />
+    </button>
+  );
+}
+
+function ImageUploadRow({
+  label,
+  value,
+  onChange,
+  onUpload,
+  uploading,
+  previewClass,
+  placeholder,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  onUpload: (f: File) => void;
+  uploading: boolean;
+  previewClass: string;
+  placeholder: string;
+}) {
+  return (
+    <div>
+      <label className="mb-1.5 block text-xs uppercase tracking-wider text-lc-muted">{label}</label>
+      <div className="flex items-center gap-3">
+        {value ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={value}
+            alt={`${label} preview`}
+            className={`${previewClass} object-cover bg-lc-black border border-lc-border`}
+          />
+        ) : (
+          <div className={`${previewClass} bg-lc-black border border-lc-border`} />
+        )}
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+          className="flex-1 rounded-lg border border-lc-border bg-lc-black px-3 py-2 text-sm text-lc-white outline-none focus:border-lc-green"
+        />
+        <label className="lc-pill lc-pill-secondary cursor-pointer whitespace-nowrap text-xs">
+          {uploading ? 'Uploading…' : 'Upload'}
+          <input
+            type="file"
+            accept="image/*"
+            className="hidden"
+            disabled={uploading}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) onUpload(f);
+              e.target.value = '';
+            }}
+          />
+        </label>
       </div>
     </div>
   );
@@ -1701,9 +2784,9 @@ function DMPanel({ peer }: { peer: string | null; onPickPeer: (p: string) => voi
           ))
         )}
       </div>
-      <form onSubmit={onSend} className="shrink-0 px-5 pb-5">
+      <form onSubmit={onSend} className="shrink-0 px-5 pt-3 pb-3">
         {error && <p className="mb-2 text-xs text-red-400">{error}</p>}
-        <div className="flex items-center gap-2 rounded-lg border border-lc-border bg-lc-card px-4 py-2 focus-within:border-lc-green">
+        <div className="flex min-h-[3.5rem] items-center gap-2 rounded-xl border border-lc-border bg-lc-card px-4 focus-within:border-lc-green">
           <input
             value={draft}
             onChange={(e) => setDraft(e.target.value)}

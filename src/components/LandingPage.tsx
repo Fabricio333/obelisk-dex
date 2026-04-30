@@ -7,7 +7,7 @@ import { useState, useEffect, useRef, type RefObject } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import Navbar from '@/components/Navbar';
-import LoginModal from '@/components/LoginModal';
+import LoginModal from '@/app/app/LoginModal';
 import ObeliskIcon from '@/components/ObeliskIcon';
 import ShootingStars from '@/components/ShootingStars';
 import FAQItem from '@/components/FAQItem';
@@ -186,11 +186,7 @@ export default function LandingPage() {
 
   const handleLoginSuccess = () => {
     setIsNavigating(true);
-    // Client-side nav preserves NDK's in-memory signer (nsec private key
-    // lives only in memory — a full reload would kill it and /chat would
-    // force-logout). The cookie-commit race is handled by a retry inside
-    // restoreSession() in the auth store.
-    router.push('/chat');
+    router.push('/app');
   };
 
   if (isNavigating) {

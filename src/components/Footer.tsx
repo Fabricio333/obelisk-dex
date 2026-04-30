@@ -85,7 +85,7 @@ export default function Footer({ localeOverride }: Props) {
             <ul className="space-y-2.5">
               <li>
                 <Link
-                  href="/chat"
+                  href="/app"
                   className="text-sm text-lc-muted hover:text-lc-green transition-colors"
                 >
                   {t('footer.launchApp')}

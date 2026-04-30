@@ -1,77 +1,62 @@
 'use client';
 
 import { useEffect, useRef } from 'react';
-import { MemberInfo } from '@/lib/mentions';
-import { useClickOutside } from '@/hooks/useClickOutside';
+import type { MemberInfo } from '@/lib/mentions';
 
-interface MentionAutocompleteProps {
+interface Props {
   members: MemberInfo[];
-  onSelect: (member: MemberInfo) => void;
-  onClose: () => void;
   selectedIndex: number;
-  /** When true, prepend a synthetic `@everyone` row at index 0. */
-  showEveryone?: boolean;
-  /** Called when the synthetic `@everyone` row is selected. */
-  onSelectEveryone?: () => void;
+  onSelect: (member: MemberInfo) => void;
+  onHover: (index: number) => void;
+  onClose: () => void;
 }
 
-export default function MentionAutocomplete({ members, onSelect, onClose, selectedIndex, showEveryone, onSelectEveryone }: MentionAutocompleteProps) {
+export default function MentionAutocomplete({ members, selectedIndex, onSelect, onHover, onClose }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
-  useClickOutside(ref, onClose);
+  useEffect(() => {
+    function onDocClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+    }
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, [onClose]);
 
-  // Scroll selected item into view
   useEffect(() => {
     itemRefs.current[selectedIndex]?.scrollIntoView({ block: 'nearest' });
   }, [selectedIndex]);
 
-  if (members.length === 0 && !showEveryone) return null;
-
-  const everyoneOffset = showEveryone ? 1 : 0;
+  if (members.length === 0) return null;
 
   return (
     <div
       ref={ref}
-      className="absolute left-4 right-4 bottom-full mb-1 z-50 bg-lc-dark border border-lc-border rounded-xl shadow-lg max-h-48 overflow-y-auto"
+      className="absolute bottom-full left-0 right-0 z-50 mb-1 max-h-48 overflow-y-auto rounded-xl border border-lc-border bg-lc-dark shadow-lg"
       data-testid="mention-autocomplete"
     >
-      {showEveryone && (
+      {members.map((m, i) => (
         <button
-          key="__everyone__"
-          ref={(el) => { itemRefs.current[0] = el; }}
-          onClick={() => onSelectEveryone?.()}
-          className={`w-full text-left px-3 py-2 flex items-center gap-2 transition-colors ${
-            0 === selectedIndex ? 'bg-lc-border/60' : 'hover:bg-lc-border/40'
-          }`}
-          data-testid="mention-option-everyone"
-        >
-          <div className="w-6 h-6 rounded-full bg-lc-green/20 flex items-center justify-center text-lc-green text-xs font-semibold">
-            @
-          </div>
-          <span className="text-sm text-lc-white font-medium">@everyone</span>
-          <span className="text-xs text-lc-muted ml-auto">Notify all members</span>
-        </button>
-      )}
-      {members.map((member, i) => (
-        <button
-          key={member.pubkey}
-          ref={(el) => { itemRefs.current[i + everyoneOffset] = el; }}
-          onClick={() => onSelect(member)}
-          className={`w-full text-left px-3 py-2 flex items-center gap-2 transition-colors ${
-            i + everyoneOffset === selectedIndex ? 'bg-lc-border/60' : 'hover:bg-lc-border/40'
+          key={m.pubkey}
+          ref={(el) => { itemRefs.current[i] = el; }}
+          type="button"
+          onMouseDown={(e) => { e.preventDefault(); onSelect(m); }}
+          onMouseEnter={() => onHover(i)}
+          className={`flex w-full items-center gap-2 px-3 py-2 text-left transition-colors ${
+            i === selectedIndex ? 'bg-lc-border/60' : 'hover:bg-lc-border/40'
           }`}
           data-testid="mention-option"
         >
-          {member.picture ? (
-            <img src={member.picture} alt="" className="w-6 h-6 rounded-full object-cover" />
+          {m.picture ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={m.picture} alt="" className="h-6 w-6 rounded-full object-cover" />
           ) : (
-            <div className="w-6 h-6 rounded-full bg-lc-olive flex items-center justify-center text-lc-green text-xs font-semibold">
-              {member.displayName[0]?.toUpperCase() || '?'}
+            <div className="flex h-6 w-6 items-center justify-center rounded-full bg-lc-border text-xs font-semibold text-lc-green">
+              {m.displayName[0]?.toUpperCase() || '?'}
             </div>
           )}
-          <span className="text-sm text-lc-white font-medium">{member.displayName}</span>
-          <span className="text-xs text-lc-muted ml-auto">{member.pubkey.slice(0, 8)}...</span>
+          <span className="truncate text-sm font-medium text-lc-white">{m.displayName}</span>
+          <span className="ml-auto truncate text-xs text-lc-muted">{m.pubkey.slice(0, 8)}…</span>
         </button>
       ))}
     </div>

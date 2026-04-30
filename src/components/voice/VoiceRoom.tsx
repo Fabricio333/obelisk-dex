@@ -62,11 +62,12 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
     let bridgeRef: NostrBridge | null = null;
     let unsubMembers: (() => void) | null = null;
     let unsubAdmins: (() => void) | null = null;
+    let unsubReady: (() => void) | null = null;
 
     let latestMembers: readonly string[] = [];
     let latestAdmins: readonly string[] = [];
+    let membershipReady = false;
     let resolveTimer: ReturnType<typeof setTimeout> | null = null;
-    let graceTimer: ReturnType<typeof setTimeout> | null = null;
 
     setGate({ phase: 'loading-roles' });
 
@@ -92,20 +93,19 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
           }
         };
 
-        // Resolve immediately on a positive match. Otherwise always wait for
-        // the grace window — the subscriptions fire synchronously with the
-        // current (often empty) store state, so we can't trust the first
-        // emission as evidence the relay has delivered 39001/39002 yet.
+        // Resolve immediately on a positive match. Otherwise wait for the
+        // bridge's "membership ready" signal — flipped to true the first time
+        // the relay delivers a 39001 or 39002 event for this group. Without
+        // that signal, an empty list could mean "not loaded yet" (slow NIP-42
+        // round-trip) just as easily as "user is not a member", and falsely
+        // flipping to "not-a-member" is what forces the refresh-loop UX.
         const tryResolve = () => {
           if (cancelled) return;
           if (latestMembers.includes(pk) || latestAdmins.includes(pk)) {
-            if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
             decide();
             return;
           }
-          if (!graceTimer) {
-            graceTimer = setTimeout(() => { graceTimer = null; decide(); }, 4000);
-          }
+          if (membershipReady) decide();
         };
 
         unsubMembers = bridge.subscribeMembers(channelId, (members) => {
@@ -116,13 +116,19 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
           latestAdmins = admins;
           tryResolve();
         });
+        unsubReady = bridge.subscribeMembershipReady(channelId, (ready) => {
+          membershipReady = ready;
+          tryResolve();
+        });
 
+        // Hard ceiling: if nothing came back at all after 12s, surface an
+        // error so the user isn't stuck on a silent spinner.
         resolveTimer = setTimeout(() => {
           if (cancelled) return;
-          if (latestMembers.length === 0 && latestAdmins.length === 0) {
+          if (!membershipReady) {
             setError('Could not load channel membership. Is this a valid channel id?');
           }
-        }, 8000);
+        }, 12000);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         if (!cancelled) setError(msg);
@@ -132,9 +138,9 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
     return () => {
       cancelled = true;
       if (resolveTimer) clearTimeout(resolveTimer);
-      if (graceTimer) clearTimeout(graceTimer);
       unsubMembers?.();
       unsubAdmins?.();
+      unsubReady?.();
       void bridgeRef;
     };
   }, [channelId]);

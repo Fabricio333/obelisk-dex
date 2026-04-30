@@ -126,16 +126,8 @@ export default function MemberList({ profileCache }: MemberListProps) {
     [memberList, onlinePubkeys],
   );
 
-  const humanMembers = memberList.filter((m) => !m.isBot);
-  const onlineCount = onlinePubkeys.size;
-
   return (
     <div className="w-60 h-full bg-lc-dark border-l border-lc-border flex flex-col shrink-0">
-      <div className="px-4 py-3 border-b border-lc-border">
-        <h3 className="text-xs font-semibold text-lc-muted uppercase tracking-wide">
-          Members — {onlineCount}/{humanMembers.length} online
-        </h3>
-      </div>
       <div className="flex-1 overflow-y-auto px-2 py-2 space-y-2" data-testid="member-list">
         {/* Bots group: always rendered first, never marked online/offline */}
         {bots.length > 0 && (

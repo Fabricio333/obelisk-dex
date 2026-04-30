@@ -11,8 +11,11 @@ export const nostrActions = {
   loginWithNip07: async (pubkeyHex: string) =>
     (await getBridge()).loginWithNip07(pubkeyHex),
 
-  loginWithBunker: async (bunkerUrl: string) =>
-    (await getBridge()).loginWithBunker(bunkerUrl),
+  loginWithBunker: async (bunkerUrl: string, options?: { onAuthUrl?: (url: string) => void }) =>
+    (await getBridge()).loginWithBunker(bunkerUrl, options),
+
+  createNostrConnectSession: async (options?: { relay?: string; onAuthUrl?: (url: string) => void }) =>
+    (await getBridge()).createNostrConnectSession(options),
 
   logout: async () => (await getBridge()).logout(),
 

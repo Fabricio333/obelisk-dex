@@ -10,11 +10,14 @@ export type RelayInfo = {
   name?: string;
   description?: string;
   icon?: string;
+  /** NIP-11 `pubkey` field — relay operator hex pubkey. Used as the
+   *  authoritative author for shared metadata like the channel layout. */
+  pubkey?: string;
   /** When the entry was fetched (ms epoch). Used for TTL. */
   fetchedAt: number;
 };
 
-const CACHE_KEY = 'obelisk:relay-info-v1';
+const CACHE_KEY = 'obelisk:relay-info-v2';
 const TTL_MS = 24 * 60 * 60 * 1000; // 24h
 const FETCH_TIMEOUT_MS = 5000;
 
@@ -71,11 +74,12 @@ export async function fetchRelayInfo(wsUrl: string): Promise<RelayInfo | null> {
         signal: ctl.signal,
       });
       if (!res.ok) return null;
-      const json = (await res.json()) as { name?: string; description?: string; icon?: string };
+      const json = (await res.json()) as { name?: string; description?: string; icon?: string; pubkey?: string };
       const info: RelayInfo = {
         name: typeof json.name === 'string' ? json.name : undefined,
         description: typeof json.description === 'string' ? json.description : undefined,
         icon: typeof json.icon === 'string' ? json.icon : undefined,
+        pubkey: typeof json.pubkey === 'string' && /^[0-9a-f]{64}$/i.test(json.pubkey) ? json.pubkey.toLowerCase() : undefined,
         fetchedAt: Date.now(),
       };
       const next = readCache();

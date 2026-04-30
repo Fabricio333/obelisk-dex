@@ -45,7 +45,7 @@ describe('Footer', () => {
       </LocaleProvider>,
     );
     const links = screen.getAllByRole('link').map((a) => a.getAttribute('href'));
-    expect(links).toContain('/chat');
+    expect(links).toContain('/app');
     expect(links).toContain('/#faq');
     expect(links).toContain('https://github.com/Fabricio333/obelisk');
     expect(links).toContain('https://lacrypta.ar');

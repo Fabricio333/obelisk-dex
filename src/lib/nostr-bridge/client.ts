@@ -21,6 +21,8 @@
  *   for the WASM swap recipe.
  */
 import { SimplePool, type Filter, type Event as NostrEvent, type EventTemplate, type VerifiedEvent, finalizeEvent, getPublicKey, nip19, nip04 } from 'nostr-tools';
+import { BunkerSigner, parseBunkerInput, createNostrConnectURI } from 'nostr-tools/nip46';
+import { generateSecretKey } from 'nostr-tools/pure';
 import { parseRelayListMeta, parseInboxRelays } from '@/lib/nostr-read';
 import { TextCoercingWebSocket } from '@/lib/nostr-pool';
 import type {
@@ -89,7 +91,13 @@ interface PersistedSession {
   pubKeyHex: string;
   loginMethod: 'nsec' | 'nip07' | 'bunker';
   relayUrl: string;
+  /** NIP-46: full bunker:// URL — used to rehydrate the signer on reload. */
+  bunkerUrl?: string;
+  /** NIP-46: hex-encoded local client secret key for the bunker channel. */
+  bunkerLocalSecretHex?: string;
 }
+
+const NOSTRCONNECT_RELAYS = ['wss://relay.nsec.app', 'wss://relay.damus.io', 'wss://nos.lol'];
 
 type Listener<T> = (value: T) => void;
 
@@ -130,6 +138,10 @@ class BridgeImpl implements NostrBridge {
   private session: PersistedSession | null = null;
   private subs: Array<{ close: () => void }> = [];
   private activeGroupId: string | null = null;
+  /** Active NIP-46 signer (when loginMethod === 'bunker'). Reconstructed lazily. */
+  private bunkerSigner: BunkerSigner | null = null;
+  /** Set by the modal so it can show the auth-challenge URL. */
+  private bunkerOnAuth: ((url: string) => void) | null = null;
 
   constructor() {
     this.pool = this.createPool();
@@ -160,6 +172,10 @@ class BridgeImpl implements NostrBridge {
             if (!win) throw new Error('NIP-07 extension unavailable');
             return (await win.signEvent(evt)) as VerifiedEvent;
           }
+          if (this.session?.loginMethod === 'bunker') {
+            const b = await this.ensureBunkerSigner();
+            return (await b.signEvent(evt as unknown as EventTemplate & { pubkey: string })) as VerifiedEvent;
+          }
           throw new Error('Cannot sign auth event with current login method');
         };
       },
@@ -179,6 +195,15 @@ class BridgeImpl implements NostrBridge {
   dmsByPeer = new StateStore<Record<string, JsDirectMessage[]>>({});
   adminsByGroup = new StateStore<Record<string, string[]>>({});
   membersByGroup = new StateStore<Record<string, string[]>>({});
+  /**
+   * Per-group flag flipped to `true` once the relay has delivered at least
+   * one kind 39001 (admins) or 39002 (members) event for that group. The
+   * voice-channel membership gate uses this as positive evidence the relay
+   * is actually responding before deciding "not-a-member" — without it, a
+   * slow NIP-42 round-trip looks identical to "user is not a member" and
+   * users have to refresh to recover.
+   */
+  membershipReadyByGroup = new StateStore<Record<string, boolean>>({});
   myFollows = new StateStore<string[]>([]);
 
   // Pubkeys we've already requested kind:0 for, to avoid duplicate subscriptions.
@@ -195,6 +220,23 @@ class BridgeImpl implements NostrBridge {
   // list — the symptom of that race is the admin badge / settings gear /
   // members rail flickering on/off until the user refreshes.
   private adminMemberLatestAt = new Map<string, number>();
+  /**
+   * After {@link resetPoolForSessionChange} rebuilds the pool, the global
+   * subscriptions get re-issued by {@link connect}, but per-group REQs
+   * (messages, reactions, admin/member, kind-0 metadata) are owned by mounted
+   * components that already called `subscribeMessages` / `subscribeAdminMember`
+   * / `ensureUserMetadata` once on mount. Components don't re-call those after
+   * login — their store listeners are still wired up — so without this
+   * snapshot the new pool has no REQs for any of them and the user has to
+   * refresh until the relay is asked again. We capture the previously-active
+   * per-group subscriptions before reset and re-issue them after reconnect.
+   */
+  private pendingResubscribe: {
+    messages: string[];
+    reactions: string[];
+    adminMember: string[];
+    metadata: string[];
+  } | null = null;
   // Per-pubkey cache of recipient NIP-65 read relays (where they read DMs).
   // Populated on first sendDirectMessage to that pubkey; TTL'd to avoid
   // requerying every send.
@@ -291,6 +333,15 @@ class BridgeImpl implements NostrBridge {
    * AUTH round-trip with the just-installed session.
    */
   private resetPoolForSessionChange(): void {
+    // Capture the per-group REQs that were live on the old pool so connect()
+    // can reopen them on the new one. Without this, components mounted before
+    // login keep their store listeners but have nothing feeding them.
+    this.pendingResubscribe = {
+      messages: Array.from(this.messageSubscribedGroups),
+      reactions: Array.from(this.reactionSubscribedGroups),
+      adminMember: Array.from(this.adminMemberSubscribedGroups),
+      metadata: Array.from(this.metadataRequested),
+    };
     this.subs.forEach((s) => s.close());
     this.subs = [];
     try { this.pool.close(this.relays); } catch { /* ignore */ }
@@ -300,14 +351,134 @@ class BridgeImpl implements NostrBridge {
     this.adminMemberSubscribedGroups.clear();
     this.adminMemberLatestAt.clear();
     this.metadataRequested.clear();
+    // Clear the per-group readiness flags too — the new pool has not seen
+    // 39001/39002 yet, so consumers must wait for fresh evidence before
+    // deciding "not a member".
+    this.membershipReadyByGroup.set({});
     this.dmSubscribed = false;
   }
 
-  async loginWithBunker(_bunkerUrl: string): Promise<string> {
-    throw new Error('NIP-46 bunker login is not yet implemented in the TS bridge. Use nsec or NIP-07.');
+  /**
+   * NIP-46 login from a `bunker://` URL.
+   * The local client secret is generated fresh per login and persisted in
+   * localStorage so the signer can be rehydrated on page reload.
+   */
+  async loginWithBunker(bunkerUrl: string, options?: { onAuthUrl?: (url: string) => void }): Promise<string> {
+    const bp = await parseBunkerInput(bunkerUrl);
+    if (!bp) throw new Error('Invalid bunker URL');
+    const localSecret = generateSecretKey();
+    this.bunkerOnAuth = options?.onAuthUrl ?? null;
+    const signer = BunkerSigner.fromBunker(localSecret, bp, {
+      onauth: (url) => {
+        if (this.bunkerOnAuth) this.bunkerOnAuth(url);
+        else if (typeof window !== 'undefined') window.open(url, '_blank', 'width=600,height=700');
+      },
+    });
+    await signer.connect();
+    const pubKeyHex = await signer.getPublicKey();
+    this.bunkerSigner = signer;
+    this.session = {
+      pubKeyHex,
+      loginMethod: 'bunker',
+      relayUrl: this.currentRelayUrl.get(),
+      bunkerUrl,
+      bunkerLocalSecretHex: bytesToHex(localSecret),
+    };
+    this.persist();
+    this.resetPoolForSessionChange();
+    this.isLoggedIn.set(true);
+    await this.connect();
+    return pubKeyHex;
+  }
+
+  /**
+   * NIP-46 NostrConnect (QR) flow — generates a `nostrconnect://` URI for the
+   * remote signer to scan. Caller is expected to render the URI as a QR code
+   * and `await waitForConnection()` to resolve once the signer connects.
+   */
+  createNostrConnectSession(options?: { relay?: string; onAuthUrl?: (url: string) => void }): {
+    uri: string;
+    waitForConnection: () => Promise<string>;
+    cancel: () => void;
+  } {
+    const localSecret = generateSecretKey();
+    const localPubkey = getPublicKey(localSecret);
+    const connectRelay = options?.relay || NOSTRCONNECT_RELAYS[0];
+    const uri = createNostrConnectURI({
+      clientPubkey: localPubkey,
+      relays: [connectRelay, ...NOSTRCONNECT_RELAYS],
+      secret: Math.random().toString(36).substring(2, 15),
+      name: 'Obelisk',
+      url: typeof window !== 'undefined' ? window.location.origin : 'https://obelisk.ar',
+    });
+
+    let cancelled = false;
+    const waitForConnection = async (): Promise<string> => {
+      this.bunkerOnAuth = options?.onAuthUrl ?? null;
+      const signer = await BunkerSigner.fromURI(localSecret, uri, {
+        onauth: (url) => {
+          if (this.bunkerOnAuth) this.bunkerOnAuth(url);
+        },
+      }, 60000);
+      if (cancelled) {
+        try { signer.close(); } catch { /* ignore */ }
+        throw new Error('NostrConnect cancelled');
+      }
+      const pubKeyHex = await signer.getPublicKey();
+      // Reconstruct a bunker:// URL from the signer's resolved BunkerPointer
+      // so we can persist + rehydrate later.
+      const bp = (signer as unknown as { bp: { pubkey: string; relays: string[]; secret?: string } }).bp;
+      const params = new URLSearchParams();
+      bp.relays.forEach((r) => params.append('relay', r));
+      if (bp.secret) params.set('secret', bp.secret);
+      const bunkerUrl = `bunker://${bp.pubkey}?${params.toString()}`;
+      this.bunkerSigner = signer;
+      this.session = {
+        pubKeyHex,
+        loginMethod: 'bunker',
+        relayUrl: this.currentRelayUrl.get(),
+        bunkerUrl,
+        bunkerLocalSecretHex: bytesToHex(localSecret),
+      };
+      this.persist();
+      this.resetPoolForSessionChange();
+      this.isLoggedIn.set(true);
+      await this.connect();
+      return pubKeyHex;
+    };
+
+    return {
+      uri,
+      waitForConnection,
+      cancel: () => { cancelled = true; },
+    };
+  }
+
+  /** Lazily (re)construct the active BunkerSigner from the persisted session. */
+  private async ensureBunkerSigner(): Promise<BunkerSigner> {
+    if (this.bunkerSigner) return this.bunkerSigner;
+    if (!this.session || this.session.loginMethod !== 'bunker' || !this.session.bunkerUrl || !this.session.bunkerLocalSecretHex) {
+      throw new Error('No bunker session to rehydrate');
+    }
+    const bp = await parseBunkerInput(this.session.bunkerUrl);
+    if (!bp) throw new Error('Invalid stored bunker URL');
+    const localSecret = hexToBytes(this.session.bunkerLocalSecretHex);
+    const signer = BunkerSigner.fromBunker(localSecret, bp, {
+      onauth: (url) => {
+        if (this.bunkerOnAuth) this.bunkerOnAuth(url);
+        else if (typeof window !== 'undefined') window.open(url, '_blank', 'width=600,height=700');
+      },
+    });
+    await signer.connect();
+    this.bunkerSigner = signer;
+    return signer;
   }
 
   async logout(): Promise<void> {
+    if (this.bunkerSigner) {
+      try { this.bunkerSigner.close(); } catch { /* ignore */ }
+      this.bunkerSigner = null;
+    }
     this.session = null;
     if (typeof window !== 'undefined') {
       window.localStorage.removeItem(STORAGE_KEY);
@@ -334,7 +505,12 @@ class BridgeImpl implements NostrBridge {
       // the WebSocket handshake, so previously every relay (even bogus
       // ones) appeared "Connected" instantly. ensureRelay actually awaits
       // the handshake and rejects on timeout / refused / DNS failure.
-      await Promise.all(
+      //
+      // Use allSettled, not all: if any single relay is slow/down/blocked,
+      // we still want to fire subscriptions on the relays that did connect.
+      // Previously one flaky relay (out of 5 defaults) would reject the
+      // whole connect and leave the UI empty until the user refreshed.
+      const results = await Promise.allSettled(
         this.relays.map(async (url) => {
           validateRelayUrl(url);
           const relay = await this.pool.ensureRelay(url, { connectionTimeout: 5000 });
@@ -345,13 +521,32 @@ class BridgeImpl implements NostrBridge {
               this.connectionState.set('Disconnected');
             }
           };
+          return url;
         }),
       );
+      const connectedCount = results.filter((r) => r.status === 'fulfilled').length;
+      if (connectedCount === 0) {
+        const firstError = results.find((r) => r.status === 'rejected') as PromiseRejectedResult | undefined;
+        throw new Error(firstError ? String(firstError.reason?.message ?? firstError.reason) : 'no relays connected');
+      }
       this.subscribeGroupMetadata();
       this.subscribeIncomingDMs();
       this.subscribeMyContactList();
       // Resolve the user's own profile so the UI has it immediately.
       if (this.session) this.ensureUserMetadata(this.session.pubKeyHex);
+      // Reopen any per-group REQs that were live on the previous pool.
+      // Components that mounted pre-login (or pre-relay-switch) still have
+      // their store listeners wired up; without this re-issue the new pool
+      // has no subscriptions feeding them and the data only appears after
+      // a manual refresh.
+      const pending = this.pendingResubscribe;
+      this.pendingResubscribe = null;
+      if (pending) {
+        pending.messages.forEach((id) => this.subscribeGroupMessages(id));
+        pending.reactions.forEach((id) => this.subscribeGroupReactions(id));
+        pending.adminMember.forEach((id) => this.subscribeAdminMember(id));
+        pending.metadata.forEach((pk) => this.ensureUserMetadata(pk));
+      }
       this.connectionState.set('Connected');
     } catch (e: unknown) {
       this.connectionState.set(`Error:${(e as Error).message}`);
@@ -482,6 +677,19 @@ class BridgeImpl implements NostrBridge {
     this.subscribeAdminMember(groupId);
     const adapter: Listener<Record<string, string[]>> = (byGroup) => cb(byGroup[groupId] ?? []);
     return this.membersByGroup.subscribe(adapter);
+  }
+
+  /**
+   * Subscribe to the "relay has delivered at least one 39001/39002 for this
+   * group" signal. Fires `false` immediately on subscribe (or `true` if a
+   * membership event was already observed), then `true` when the first event
+   * lands. Callers should also call {@link subscribeMembers} /
+   * {@link subscribeAdmins} so the underlying REQ is open.
+   */
+  subscribeMembershipReady(groupId: string, cb: (ready: boolean) => void): Unsubscribe {
+    this.subscribeAdminMember(groupId);
+    const adapter: Listener<Record<string, boolean>> = (m) => cb(!!m[groupId]);
+    return this.membershipReadyByGroup.subscribe(adapter);
   }
 
   ensureUserMetadata(pubkey: string): void {
@@ -812,6 +1020,77 @@ class BridgeImpl implements NostrBridge {
   // -- Internals ---------------------------------------------------------
 
   /**
+   * Wrap `pool.subscribe` with a per-subscription watchdog.
+   *
+   * On first load (and after relay/session resets) a relay's NIP-42 AUTH
+   * round-trip can race past the initial REQ, or a transient network blip
+   * can drop the sub silently. Symptoms: categories render but channels
+   * don't; messages stay empty until the user refreshes 2-3 times.
+   *
+   * If neither an EVENT nor an EOSE arrives within WATCHDOG_MS, we close
+   * the sub and re-issue it (with backoff, up to MAX_ATTEMPTS). EOSE alone
+   * is enough to consider the sub alive — even if the relay has nothing
+   * stored, EOSE proves the REQ is live and live events will stream.
+   */
+  private subscribeWatched(
+    relays: string[],
+    filter: Filter,
+    onevent: (ev: NostrEvent) => void,
+    oneose?: () => void,
+  ): { close: () => void } {
+    const WATCHDOG_MS = 5000;
+    const MAX_ATTEMPTS = 4;
+    let attempt = 0;
+    let activeSub: { close: () => void } | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let closed = false;
+    let alive = false;
+
+    const clearTimer = () => {
+      if (timer) { clearTimeout(timer); timer = null; }
+    };
+
+    const start = () => {
+      if (closed) return;
+      attempt++;
+      alive = false;
+      const sub = this.pool.subscribe(relays, filter, {
+        onevent: (ev) => {
+          alive = true;
+          clearTimer();
+          onevent(ev);
+        },
+        oneose: () => {
+          alive = true;
+          clearTimer();
+          oneose?.();
+        },
+        onauth: this.getAuthSigner(),
+      });
+      activeSub = sub;
+      timer = setTimeout(() => {
+        if (closed || alive) return;
+        try { sub.close(); } catch { /* ignore */ }
+        activeSub = null;
+        if (attempt < MAX_ATTEMPTS) {
+          const delay = Math.min(1000 * 2 ** (attempt - 1), 8000);
+          timer = setTimeout(start, delay);
+        }
+      }, WATCHDOG_MS);
+    };
+
+    start();
+
+    return {
+      close: () => {
+        closed = true;
+        clearTimer();
+        try { activeSub?.close(); } catch { /* ignore */ }
+      },
+    };
+  }
+
+  /**
    * Return a signing function suitable for `onauth` params in pool.subscribe
    * and pool.publish. When the relay sends CLOSED "auth-required:…" the pool
    * uses this to authenticate and retry the operation automatically.
@@ -842,6 +1121,10 @@ class BridgeImpl implements NostrBridge {
       if (!win) throw new Error('NIP-07 extension unavailable');
       return (await win.signEvent(fullTemplate)) as NostrEvent;
     }
+    if (this.session.loginMethod === 'bunker') {
+      const b = await this.ensureBunkerSigner();
+      return (await b.signEvent(fullTemplate)) as NostrEvent;
+    }
     throw new Error(`Login method ${this.session.loginMethod} cannot sign events in this build`);
   }
 
@@ -857,16 +1140,17 @@ class BridgeImpl implements NostrBridge {
         if (!win) throw new Error('NIP-07 extension unavailable');
         return (await win.signEvent(evt)) as VerifiedEvent;
       }
+      if (this.session?.loginMethod === 'bunker') {
+        const b = await this.ensureBunkerSigner();
+        return (await b.signEvent(evt as unknown as EventTemplate & { pubkey: string })) as VerifiedEvent;
+      }
       throw new Error('Cannot sign auth event with current login method');
     };
   }
 
   private subscribeGroupMetadata(): void {
     const filter: Filter = { kinds: [KIND_GROUP_METADATA] };
-    const sub = this.pool.subscribe(this.relays, filter, {
-      onevent: (ev) => this.ingestGroupMetadata(ev),
-      onauth: this.getAuthSigner(),
-    });
+    const sub = this.subscribeWatched(this.relays, filter, (ev) => this.ingestGroupMetadata(ev));
     this.subs.push(sub);
   }
 
@@ -878,20 +1162,14 @@ class BridgeImpl implements NostrBridge {
       '#h': [groupId],
       limit: 200,
     };
-    const sub = this.pool.subscribe(this.relays, filter, {
-      onevent: (ev) => this.ingestMessage(groupId, ev),
-      onauth: this.getAuthSigner(),
-    });
+    const sub = this.subscribeWatched(this.relays, filter, (ev) => this.ingestMessage(groupId, ev));
     this.subs.push(sub);
   }
 
   private subscribeKind0(pubkey: string): void {
     const filter: Filter = { kinds: [KIND_USER_METADATA], authors: [pubkey] };
     const relays = Array.from(new Set([...this.relays, ...PROFILE_RELAYS]));
-    const sub = this.pool.subscribe(relays, filter, {
-      onevent: (ev) => this.ingestUserMetadata(ev),
-      onauth: this.getAuthSigner(),
-    });
+    const sub = this.subscribeWatched(relays, filter, (ev) => this.ingestUserMetadata(ev));
     this.subs.push(sub);
   }
 
@@ -899,10 +1177,7 @@ class BridgeImpl implements NostrBridge {
     if (this.reactionSubscribedGroups.has(groupId)) return;
     this.reactionSubscribedGroups.add(groupId);
     const filter: Filter = { kinds: [KIND_REACTION], '#h': [groupId], limit: 500 };
-    const sub = this.pool.subscribe(this.relays, filter, {
-      onevent: (ev) => this.ingestReaction(groupId, ev),
-      onauth: this.getAuthSigner(),
-    });
+    const sub = this.subscribeWatched(this.relays, filter, (ev) => this.ingestReaction(groupId, ev));
     this.subs.push(sub);
   }
 
@@ -913,10 +1188,7 @@ class BridgeImpl implements NostrBridge {
       kinds: [KIND_GROUP_ADMINS, KIND_GROUP_MEMBERS],
       '#d': [groupId],
     };
-    const sub = this.pool.subscribe(this.relays, filter, {
-      onevent: (ev) => this.ingestAdminMember(ev),
-      onauth: this.getAuthSigner(),
-    });
+    const sub = this.subscribeWatched(this.relays, filter, (ev) => this.ingestAdminMember(ev));
     this.subs.push(sub);
   }
 
@@ -935,6 +1207,12 @@ class BridgeImpl implements NostrBridge {
     const pubkeys = ev.tags.filter((t) => t[0] === 'p').map((t) => t[1]);
     const store = ev.kind === KIND_GROUP_ADMINS ? this.adminsByGroup : this.membersByGroup;
     store.update((prev) => ({ ...prev, [groupId]: pubkeys }));
+    // Positive signal: the relay has delivered membership data for this
+    // group, even if the list is empty. Consumers (voice gate) can now
+    // distinguish "not loaded yet" from "loaded and you're not in it".
+    this.membershipReadyByGroup.update((prev) =>
+      prev[groupId] ? prev : { ...prev, [groupId]: true },
+    );
     pubkeys.forEach((pk) => this.ensureUserMetadata(pk));
   }
 
@@ -947,17 +1225,14 @@ class BridgeImpl implements NostrBridge {
     // empty for anyone whose contact list lives elsewhere.
     const relays = Array.from(new Set([...this.relays, ...PROFILE_RELAYS]));
     let latestCreatedAt = 0;
-    const sub = this.pool.subscribe(relays, filter, {
-      onevent: (ev) => {
-        // Multiple relays may return different revisions of kind 3; keep the
-        // newest by created_at so an older replica doesn't clobber a newer one.
-        if (ev.created_at <= latestCreatedAt) return;
-        latestCreatedAt = ev.created_at;
-        const pubkeys = ev.tags.filter((t) => t[0] === 'p').map((t) => t[1]);
-        this.myFollows.set(pubkeys);
-        pubkeys.forEach((pk) => this.ensureUserMetadata(pk));
-      },
-      onauth: this.getAuthSigner(),
+    const sub = this.subscribeWatched(relays, filter, (ev) => {
+      // Multiple relays may return different revisions of kind 3; keep the
+      // newest by created_at so an older replica doesn't clobber a newer one.
+      if (ev.created_at <= latestCreatedAt) return;
+      latestCreatedAt = ev.created_at;
+      const pubkeys = ev.tags.filter((t) => t[0] === 'p').map((t) => t[1]);
+      this.myFollows.set(pubkeys);
+      pubkeys.forEach((pk) => this.ensureUserMetadata(pk));
     });
     this.subs.push(sub);
   }
@@ -970,10 +1245,7 @@ class BridgeImpl implements NostrBridge {
     const filterIn: Filter = { kinds: [KIND_DIRECT_MESSAGE], '#p': [me], limit: 200 };
     const filterOut: Filter = { kinds: [KIND_DIRECT_MESSAGE], authors: [me], limit: 200 };
     for (const f of [filterIn, filterOut]) {
-      const sub = this.pool.subscribe(this.relays, f, {
-        onevent: (ev) => this.ingestIncomingDM(ev),
-        onauth: this.getAuthSigner(),
-      });
+      const sub = this.subscribeWatched(this.relays, f, (ev) => this.ingestIncomingDM(ev));
       this.subs.push(sub);
     }
     // Wide-net pickup: other clients publish DMs to the user's own NIP-17
@@ -984,10 +1256,7 @@ class BridgeImpl implements NostrBridge {
       if (extras.length === 0) return;
       this.myDmRelays = extras;
       for (const f of [filterIn, filterOut]) {
-        const sub = this.pool.subscribe(extras, f, {
-          onevent: (ev) => this.ingestIncomingDM(ev),
-          onauth: this.getAuthSigner(),
-        });
+        const sub = this.subscribeWatched(extras, f, (ev) => this.ingestIncomingDM(ev));
         this.subs.push(sub);
       }
     });
@@ -1122,6 +1391,10 @@ class BridgeImpl implements NostrBridge {
       if (!w?.nip04?.encrypt) throw new Error('Extension does not support NIP-04 encryption');
       return w.nip04.encrypt(recipientPubkey, content);
     }
+    if (this.session.loginMethod === 'bunker') {
+      const b = await this.ensureBunkerSigner();
+      return b.nip04Encrypt(recipientPubkey, content);
+    }
     throw new Error('Cannot encrypt with current login method');
   }
 
@@ -1134,6 +1407,10 @@ class BridgeImpl implements NostrBridge {
       const w = (window as any).nostr;
       if (!w?.nip04?.decrypt) throw new Error('Extension does not support NIP-04 decryption');
       return w.nip04.decrypt(senderPubkey, ciphertext);
+    }
+    if (this.session.loginMethod === 'bunker') {
+      const b = await this.ensureBunkerSigner();
+      return b.nip04Decrypt(senderPubkey, ciphertext);
     }
     throw new Error('Cannot decrypt with current login method');
   }
@@ -1227,6 +1504,9 @@ class BridgeImpl implements NostrBridge {
       const win = (window as any).nostr;
       if (!win) throw new Error('NIP-07 extension unavailable');
       event = (await win.signEvent({ ...template, pubkey: this.session.pubKeyHex })) as NostrEvent;
+    } else if (this.session.loginMethod === 'bunker') {
+      const b = await this.ensureBunkerSigner();
+      event = (await b.signEvent(template)) as NostrEvent;
     } else {
       throw new Error(`Login method ${this.session.loginMethod} cannot sign events in this build`);
     }
@@ -1290,6 +1570,10 @@ function generateGroupId(): string {
   } else {
     for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
   }
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 

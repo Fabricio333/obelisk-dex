@@ -1,0 +1,215 @@
+/**
+ * Shared channel layout — categories + channel ordering, stored as a
+ * NIP-78 (kind 30078) replaceable parameterized event authored by the
+ * **relay operator** (NIP-11 `pubkey`). Everyone subscribed to the relay
+ * sees the same ordering; only the operator can publish/edit.
+ *
+ * d-tag: `obelisk:layout:<relayUrl>`
+ *
+ * Tags:
+ *   ["category", catId, name, position]
+ *   ["channel",  channelId, catId|"", position]
+ *
+ * Channels not listed in any category render under an Uncategorized bucket
+ * at the bottom. Categories with no children still render (operator can
+ * drop channels into them).
+ */
+import { useEffect, useState } from 'react';
+import type { Event as NostrEvent, Filter } from 'nostr-tools';
+import { getBridge, getBridgeImpl } from '@/lib/nostr-bridge/client';
+import { fetchRelayInfo } from '@/lib/relay-info';
+
+const KIND_LAYOUT = 30078;
+
+export interface ChannelLayoutCategory {
+  readonly id: string;
+  readonly name: string;
+  readonly position: number;
+}
+
+export interface ChannelLayoutChannel {
+  readonly id: string;
+  readonly categoryId: string | null;
+  readonly position: number;
+}
+
+export interface ChannelLayout {
+  readonly categories: ReadonlyArray<ChannelLayoutCategory>;
+  readonly channels: ReadonlyArray<ChannelLayoutChannel>;
+  /** created_at of the source event, or 0 if none seen yet. */
+  readonly updatedAt: number;
+}
+
+export const EMPTY_LAYOUT: ChannelLayout = { categories: [], channels: [], updatedAt: 0 };
+
+function dTag(relayUrl: string): string {
+  return `obelisk:layout:${relayUrl}`;
+}
+
+function parseLayout(ev: NostrEvent): ChannelLayout {
+  const categories: ChannelLayoutCategory[] = [];
+  const channels: ChannelLayoutChannel[] = [];
+  for (const t of ev.tags) {
+    if (t[0] === 'category' && t[1] && t[2] !== undefined) {
+      categories.push({
+        id: t[1],
+        name: t[2] || 'Untitled',
+        position: parseInt(t[3] ?? '0', 10) || 0,
+      });
+    } else if (t[0] === 'channel' && t[1]) {
+      channels.push({
+        id: t[1],
+        categoryId: t[2] ? t[2] : null,
+        position: parseInt(t[3] ?? '0', 10) || 0,
+      });
+    }
+  }
+  categories.sort((a, b) => a.position - b.position);
+  channels.sort((a, b) => a.position - b.position);
+  return { categories, channels, updatedAt: ev.created_at };
+}
+
+function toTags(layout: ChannelLayout, relayUrl: string): string[][] {
+  const tags: string[][] = [['d', dTag(relayUrl)]];
+  layout.categories.forEach((c, i) => {
+    tags.push(['category', c.id, c.name, String(i)]);
+  });
+  layout.channels.forEach((ch, i) => {
+    tags.push(['channel', ch.id, ch.categoryId ?? '', String(i)]);
+  });
+  return tags;
+}
+
+/**
+ * Subscribe to layout events authored by `operatorPubkey` for the given
+ * relay. Calls `onChange` with the freshest layout seen so far; older
+ * events are dropped.
+ */
+export function subscribeLayout(
+  relayUrl: string,
+  operatorPubkey: string,
+  onChange: (layout: ChannelLayout) => void,
+): () => void {
+  const impl = getBridgeImpl();
+  if (!impl) {
+    let cancelled = false;
+    let unsub: (() => void) | null = null;
+    void getBridge().then(() => {
+      if (cancelled) return;
+      unsub = subscribeLayout(relayUrl, operatorPubkey, onChange);
+    });
+    return () => {
+      cancelled = true;
+      unsub?.();
+    };
+  }
+
+  let latest: ChannelLayout = EMPTY_LAYOUT;
+  const filter: Filter = {
+    kinds: [KIND_LAYOUT],
+    authors: [operatorPubkey],
+    '#d': [dTag(relayUrl)],
+  };
+  return impl.subscribeFilter(filter, (ev) => {
+    if (ev.created_at <= latest.updatedAt) return;
+    latest = parseLayout(ev);
+    onChange(latest);
+  });
+}
+
+export async function publishLayout(relayUrl: string, layout: ChannelLayout): Promise<void> {
+  await getBridge();
+  const impl = getBridgeImpl();
+  if (!impl) throw new Error('nostr bridge not initialized');
+  await impl.publishEvent({
+    kind: KIND_LAYOUT,
+    content: '',
+    tags: toTags(layout, relayUrl),
+  });
+}
+
+export function useChannelLayout(relayUrl: string | null, operatorPubkey: string | null): ChannelLayout {
+  const [layout, setLayout] = useState<ChannelLayout>(EMPTY_LAYOUT);
+  useEffect(() => {
+    setLayout(EMPTY_LAYOUT);
+    if (!relayUrl || !operatorPubkey) return;
+    return subscribeLayout(relayUrl, operatorPubkey, setLayout);
+  }, [relayUrl, operatorPubkey]);
+  return layout;
+}
+
+/**
+ * Resolve the relay operator pubkey from the NIP-11 document. Returns
+ * `null` until the fetch completes (or if the relay doesn't advertise a
+ * pubkey).
+ */
+export function useRelayOperatorPubkey(relayUrl: string | null): string | null {
+  const [pk, setPk] = useState<string | null>(null);
+  useEffect(() => {
+    setPk(null);
+    if (!relayUrl) return;
+    let cancelled = false;
+    void fetchRelayInfo(relayUrl).then((info) => {
+      if (cancelled) return;
+      setPk(info?.pubkey ?? null);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [relayUrl]);
+  return pk;
+}
+
+// -- Pure helpers used by the UI ---------------------------------------------
+
+export interface LaidOutSidebar {
+  readonly categories: ReadonlyArray<{
+    readonly id: string;
+    readonly name: string;
+    readonly channelIds: ReadonlyArray<string>;
+  }>;
+  readonly uncategorized: ReadonlyArray<string>;
+}
+
+/**
+ * Apply a layout to the canonical channel list, returning render-ready
+ * groupings. Channels missing from the layout fall to `uncategorized` in
+ * their original order; channels in the layout but missing from
+ * `allChannelIds` are dropped (they may have been deleted server-side).
+ */
+export function applyLayout(layout: ChannelLayout, allChannelIds: ReadonlyArray<string>): LaidOutSidebar {
+  const known = new Set(allChannelIds);
+  const placed = new Set<string>();
+  const byCat = new Map<string, string[]>();
+  for (const ch of layout.channels) {
+    if (!known.has(ch.id)) continue;
+    if (ch.categoryId) {
+      const arr = byCat.get(ch.categoryId) ?? [];
+      arr.push(ch.id);
+      byCat.set(ch.categoryId, arr);
+    }
+    placed.add(ch.id);
+  }
+  const categories = layout.categories.map((c) => ({
+    id: c.id,
+    name: c.name,
+    channelIds: byCat.get(c.id) ?? [],
+  }));
+  const uncategorized: string[] = [];
+  // First the explicitly-uncategorized (in layout, no catId), then anything
+  // not referenced at all in the layout (preserving relay order).
+  for (const ch of layout.channels) {
+    if (!known.has(ch.id)) continue;
+    if (!ch.categoryId) uncategorized.push(ch.id);
+  }
+  for (const id of allChannelIds) {
+    if (!placed.has(id)) uncategorized.push(id);
+  }
+  return { categories, uncategorized };
+}
+
+export function newCategoryId(): string {
+  // Short, URL-safe, low-collision. Only needs to be unique within one user's
+  // layout.
+  return Math.random().toString(36).slice(2, 10);
+}

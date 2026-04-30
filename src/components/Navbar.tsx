@@ -5,7 +5,6 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useAuthStore } from '@/store/auth';
 import { useTranslation } from '@/i18n/context';
-import LoginModal from './LoginModal';
 import ObeliskIcon from './ObeliskIcon';
 import LanguageToggle from './LanguageToggle';
 import { guidesHref } from '@/lib/guide-urls';
@@ -174,7 +173,7 @@ export default function Navbar({ onLoginSuccess }: { onLoginSuccess?: () => void
                         </div>
                       </div>
                       <a
-                        href="/profile"
+                        href="/app"
                         className="w-full p-3 text-left text-sm text-lc-muted hover:bg-lc-border/50 hover:text-lc-white transition flex items-center gap-2"
                         data-testid="nav-profile-link"
                       >

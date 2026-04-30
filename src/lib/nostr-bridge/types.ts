@@ -77,7 +77,20 @@ export interface NostrBridge {
 
   loginWithNsec(privKeyHex: string, pubKeyHex: string): Promise<void>;
   loginWithNip07(pubkeyHex: string): Promise<void>;
-  loginWithBunker(bunkerUrl: string): Promise<string>;
+  loginWithBunker(bunkerUrl: string, options?: { onAuthUrl?: (url: string) => void }): Promise<string>;
+  /**
+   * NIP-46 NostrConnect (QR) flow. Returns a `nostrconnect://` URI to render
+   * as a QR code; `waitForConnection()` resolves with the user's pubkey hex
+   * once the remote signer connects.
+   */
+  createNostrConnectSession(options?: {
+    relay?: string;
+    onAuthUrl?: (url: string) => void;
+  }): {
+    uri: string;
+    waitForConnection: () => Promise<string>;
+    cancel: () => void;
+  };
   logout(): Promise<void>;
   getPublicKey(): string | null;
 
@@ -111,6 +124,14 @@ export interface NostrBridge {
   subscribeAdmins(groupId: string, cb: (admins: ReadonlyArray<string>) => void): Unsubscribe;
   /** NIP-29 39002 members (relay-published). */
   subscribeMembers(groupId: string, cb: (members: ReadonlyArray<string>) => void): Unsubscribe;
+  /**
+   * Fires `true` once the relay has delivered at least one 39001 or 39002
+   * event for the group, otherwise `false`. Use as positive evidence the
+   * relay has actually responded before treating an empty members list as
+   * "not a member" — without this signal, a slow NIP-42 round-trip looks
+   * identical to a real non-membership.
+   */
+  subscribeMembershipReady(groupId: string, cb: (ready: boolean) => void): Unsubscribe;
   /** NIP-02 kind 3 follows for the local user. */
   subscribeMyFollows(cb: (pubkeys: ReadonlyArray<string>) => void): Unsubscribe;
 
