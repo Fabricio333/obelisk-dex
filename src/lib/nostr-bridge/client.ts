@@ -21,6 +21,8 @@
  *   for the WASM swap recipe.
  */
 import { SimplePool, type Filter, type Event as NostrEvent, type EventTemplate, type VerifiedEvent, finalizeEvent, getPublicKey, nip19, nip04 } from 'nostr-tools';
+import { parseRelayListMeta, parseInboxRelays } from '@/lib/nostr-read';
+import { TextCoercingWebSocket } from '@/lib/nostr-pool';
 import type {
   NostrBridge,
   JsGroup,
@@ -47,9 +49,29 @@ const KIND_GROUP_DELETE_EVENT = 9005;
 const KIND_GROUP_ADMINS = 39001;
 const KIND_GROUP_MEMBERS = 39002;
 
-const STORAGE_KEY = 'obeliskord/session';
-const RELAYS_KEY = 'obeliskord/relays';
+export const STORAGE_KEY = 'obelisk-dex/session';
+export const RELAYS_KEY = 'obelisk-dex/relays';
+const LEGACY_STORAGE_KEY = 'obeliskord/session';
+const LEGACY_RELAYS_KEY = 'obeliskord/relays';
 const DEFAULT_RELAY = 'wss://relay.obelisk.ar';
+
+/**
+ * Read a localStorage value under the current key, falling back to the legacy
+ * key (one-time migration: writes the value under the new key and deletes the
+ * legacy entry).
+ */
+function readMigrated(key: string, legacyKey: string): string | null {
+  if (typeof window === 'undefined') return null;
+  const cur = window.localStorage.getItem(key);
+  if (cur !== null) return cur;
+  const legacy = window.localStorage.getItem(legacyKey);
+  if (legacy !== null) {
+    window.localStorage.setItem(key, legacy);
+    window.localStorage.removeItem(legacyKey);
+    return legacy;
+  }
+  return null;
+}
 
 // Outbox/profile relays for fetching kind:0 metadata. NIP-29 group relays
 // generally don't carry user profile events, so we query well-known public
@@ -120,6 +142,12 @@ class BridgeImpl implements NostrBridge {
    */
   private createPool(): SimplePool {
     return new SimplePool({
+      // Some relays (or compressing proxies) push EVENT/EOSE frames as
+      // binary. nostr-tools' default parser does `json.slice(...).indexOf(...)`
+      // unconditionally and crashes on any non-string payload, silently
+      // dropping events. TextCoercingWebSocket UTF-8-decodes binary frames
+      // before the parser sees them. Same fix as `getNostrPool()`.
+      websocketImplementation: TextCoercingWebSocket as unknown as typeof WebSocket,
       automaticallyAuth: (_relayUrl: string) => {
         if (!this.session) return null;
         return async (evt: EventTemplate): Promise<VerifiedEvent> => {
@@ -155,14 +183,29 @@ class BridgeImpl implements NostrBridge {
 
   // Pubkeys we've already requested kind:0 for, to avoid duplicate subscriptions.
   private metadataRequested = new Set<string>();
+  // Group ids we already have a message subscription for.
+  private messageSubscribedGroups = new Set<string>();
   // Group ids we already have a reaction subscription for.
   private reactionSubscribedGroups = new Set<string>();
   private dmSubscribed = false;
   private adminMemberSubscribedGroups = new Set<string>();
+  // Newest `created_at` we've seen for kind-39001 (admins) / kind-39002
+  // (members) per group id. Used to drop out-of-order ingests so an older
+  // revision arriving second from a slower relay can't clobber the newer
+  // list — the symptom of that race is the admin badge / settings gear /
+  // members rail flickering on/off until the user refreshes.
+  private adminMemberLatestAt = new Map<string, number>();
+  // Per-pubkey cache of recipient NIP-65 read relays (where they read DMs).
+  // Populated on first sendDirectMessage to that pubkey; TTL'd to avoid
+  // requerying every send.
+  private recipientReadRelaysCache = new Map<string, { relays: string[]; fetchedAt: number }>();
+  // Own NIP-17 inbox + NIP-65 relays — wider than `this.relays`. Used to
+  // subscribe for incoming DMs published to relays the user actually reads.
+  private myDmRelays: string[] = [];
 
   async initialize(): Promise<void> {
     if (typeof window !== 'undefined') {
-      const rawRelays = window.localStorage.getItem(RELAYS_KEY);
+      const rawRelays = readMigrated(RELAYS_KEY, LEGACY_RELAYS_KEY);
       if (rawRelays) {
         try {
           const list = JSON.parse(rawRelays) as string[];
@@ -174,7 +217,7 @@ class BridgeImpl implements NostrBridge {
         }
       }
     }
-    const raw = typeof window !== 'undefined' ? window.localStorage.getItem(STORAGE_KEY) : null;
+    const raw = readMigrated(STORAGE_KEY, LEGACY_STORAGE_KEY);
     if (!raw) return;
     try {
       const parsed = JSON.parse(raw) as PersistedSession;
@@ -218,6 +261,7 @@ class BridgeImpl implements NostrBridge {
       relayUrl: this.currentRelayUrl.get(),
     };
     this.persist();
+    this.resetPoolForSessionChange();
     this.isLoggedIn.set(true);
     await this.connect();
   }
@@ -232,8 +276,31 @@ class BridgeImpl implements NostrBridge {
       relayUrl: this.currentRelayUrl.get(),
     };
     this.persist();
+    this.resetPoolForSessionChange();
     this.isLoggedIn.set(true);
     await this.connect();
+  }
+
+  /**
+   * Tear down sockets and rebuild the pool when the session changes.
+   * SimplePool resolves `automaticallyAuth(relayUrl)` per challenge, but the
+   * underlying Relay caches AUTH-handshake state on the open socket. If the
+   * pool was opened earlier without a session, the relay can settle into a
+   * no-auth state and silently filter out auth-required reads — symptom is
+   * "channels load but messages inside don't". A fresh socket forces a new
+   * AUTH round-trip with the just-installed session.
+   */
+  private resetPoolForSessionChange(): void {
+    this.subs.forEach((s) => s.close());
+    this.subs = [];
+    try { this.pool.close(this.relays); } catch { /* ignore */ }
+    this.pool = this.createPool();
+    this.messageSubscribedGroups.clear();
+    this.reactionSubscribedGroups.clear();
+    this.adminMemberSubscribedGroups.clear();
+    this.adminMemberLatestAt.clear();
+    this.metadataRequested.clear();
+    this.dmSubscribed = false;
   }
 
   async loginWithBunker(_bunkerUrl: string): Promise<string> {
@@ -242,7 +309,10 @@ class BridgeImpl implements NostrBridge {
 
   async logout(): Promise<void> {
     this.session = null;
-    if (typeof window !== 'undefined') window.localStorage.removeItem(STORAGE_KEY);
+    if (typeof window !== 'undefined') {
+      window.localStorage.removeItem(STORAGE_KEY);
+      window.localStorage.removeItem(LEGACY_STORAGE_KEY);
+    }
     this.dispose();
     this.pool = this.createPool();
     this.isLoggedIn.set(false);
@@ -302,8 +372,10 @@ class BridgeImpl implements NostrBridge {
     this.groups.set([]);
     this.messagesByGroup.set({});
     // Reset per-group caches: they're scoped to one relay.
+    this.messageSubscribedGroups.clear();
     this.reactionSubscribedGroups.clear();
     this.adminMemberSubscribedGroups.clear();
+    this.adminMemberLatestAt.clear();
     this.metadataRequested.clear();
     this.adminsByGroup.set({});
     this.membersByGroup.set({});
@@ -318,7 +390,9 @@ class BridgeImpl implements NostrBridge {
     // Verify the relay is actually reachable before persisting it. Use a
     // throwaway pool so a failed probe doesn't pollute the live pool's
     // internal relay map, and so we can guarantee the socket is closed.
-    const probe = new SimplePool();
+    const probe = new SimplePool({
+      websocketImplementation: TextCoercingWebSocket as unknown as typeof WebSocket,
+    } as ConstructorParameters<typeof SimplePool>[0]);
     try {
       const relay = await probe.ensureRelay(trimmed, { connectionTimeout: 5000 });
       if (!relay.connected) throw new Error('relay did not complete handshake');
@@ -358,6 +432,9 @@ class BridgeImpl implements NostrBridge {
     return this.groups.subscribe(cb);
   }
   subscribeMessages(groupId: string, cb: (msgs: ReadonlyArray<JsMessage>) => void): Unsubscribe {
+    // Belt-and-braces: messages start streaming as soon as group metadata
+    // arrives (see ingestGroupMetadata). This call is idempotent and only
+    // matters for groups the user opens via deep link before metadata lands.
     this.subscribeGroupMessages(groupId);
     const adapter: Listener<Record<string, JsMessage[]>> = (byGroup) => cb(byGroup[groupId] ?? []);
     return this.messagesByGroup.subscribe(adapter);
@@ -415,11 +492,16 @@ class BridgeImpl implements NostrBridge {
 
   // -- Group operations --------------------------------------------------
 
-  async sendMessage(groupId: string, content: string): Promise<void> {
+  async sendMessage(groupId: string, content: string, replyTo?: { id: string; pubkey: string } | null): Promise<void> {
+    const tags: string[][] = [['h', groupId]];
+    if (replyTo) {
+      tags.push(['e', replyTo.id, '', 'reply']);
+      tags.push(['p', replyTo.pubkey]);
+    }
     const event = await this.signAndPublish({
       kind: KIND_GROUP_MESSAGE,
       content,
-      tags: [['h', groupId]],
+      tags,
       created_at: Math.floor(Date.now() / 1000),
     });
     this.ingestMessage(groupId, event);
@@ -442,12 +524,19 @@ class BridgeImpl implements NostrBridge {
   async sendDirectMessage(recipientPubkey: string, content: string): Promise<void> {
     if (!this.session) throw new Error('Not logged in');
     const cipher = await this.encryptNip04(recipientPubkey, content);
-    const event = await this.signAndPublish({
-      kind: KIND_DIRECT_MESSAGE,
-      content: cipher,
-      tags: [['p', recipientPubkey]],
-      created_at: Math.floor(Date.now() / 1000),
-    });
+    // NIP-04 DMs are delivered to the recipient's NIP-65 read relays; without
+    // this, sends to anyone whose read set doesn't include `this.relays` will
+    // never reach them. Failure to look up just falls back to `this.relays`.
+    const extraRelays = await this.fetchRecipientReadRelays(recipientPubkey).catch(() => [] as string[]);
+    const event = await this.signAndPublish(
+      {
+        kind: KIND_DIRECT_MESSAGE,
+        content: cipher,
+        tags: [['p', recipientPubkey]],
+        created_at: Math.floor(Date.now() / 1000),
+      },
+      extraRelays,
+    );
     // Optimistic local ingest — also avoids depending on relay echo of own DMs.
     this.ingestDM(event, content, /*outgoing*/ true, recipientPubkey);
   }
@@ -478,6 +567,7 @@ class BridgeImpl implements NostrBridge {
     banner?: string;
     isPublic?: boolean;
     isOpen?: boolean;
+    kind?: 'text' | 'voice';
   }): Promise<string> {
     const groupId = opts.groupId ?? generateGroupId();
     await this.signAndPublish({
@@ -486,6 +576,21 @@ class BridgeImpl implements NostrBridge {
       tags: [['h', groupId]],
       created_at: Math.floor(Date.now() / 1000),
     });
+    // NIP-29 says the relay SHOULD make the creator the first admin, but in
+    // practice some relays only emit kind 39001 once an explicit kind 9000
+    // ['p', creator, 'admin'] is published. Without this the creator opens
+    // their own freshly-made channel and the gear icon doesn't show up.
+    // Belt-and-braces: explicitly claim admin for the creator. Idempotent on
+    // relays that already did the right thing.
+    if (this.session) {
+      try {
+        await this.putUser(groupId, this.session.pubKeyHex, ['admin']);
+      } catch (err) {
+        // Some relays reject self-elevation when they already auto-elevated
+        // the creator — that's fine, swallow.
+        console.warn('[bridge] createGroup: claim-admin putUser failed', err);
+      }
+    }
     await this.editGroupMetadata({ ...opts, groupId });
     return groupId;
   }
@@ -527,6 +632,7 @@ class BridgeImpl implements NostrBridge {
     banner?: string;
     isPublic?: boolean;
     isOpen?: boolean;
+    kind?: 'text' | 'voice';
   }): Promise<void> {
     const tags: string[][] = [['h', opts.groupId]];
     if (opts.name !== undefined) tags.push(['name', opts.name]);
@@ -535,6 +641,10 @@ class BridgeImpl implements NostrBridge {
     if (opts.banner !== undefined) tags.push(['banner', opts.banner]);
     if (opts.isPublic !== undefined) tags.push([opts.isPublic ? 'public' : 'private']);
     if (opts.isOpen !== undefined) tags.push([opts.isOpen ? 'open' : 'closed']);
+    // The voice marker is "just another tag" on kind 9002; the relay reflects
+    // it on kind 39000 like name/about. Omitting the tag (kind: 'text') makes
+    // a previously-voice channel revert to a regular text channel.
+    if (opts.kind === 'voice') tags.push(['t', 'voice']);
     await this.signAndPublish({
       kind: KIND_GROUP_EDIT_METADATA,
       content: '',
@@ -645,6 +755,60 @@ class BridgeImpl implements NostrBridge {
     this.activeGroupId = groupId;
   }
 
+  // -- Voice channels ---------------------------------------------------
+
+  /** Read-once snapshot of admins for a group; subscribes if not already. */
+  getAdmins(groupId: string): readonly string[] {
+    this.subscribeAdminMember(groupId);
+    return this.adminsByGroup.get()[groupId] ?? [];
+  }
+
+  /** Read-once snapshot of members for a group; subscribes if not already. */
+  getMembers(groupId: string): readonly string[] {
+    this.subscribeAdminMember(groupId);
+    return this.membersByGroup.get()[groupId] ?? [];
+  }
+
+  // -- Voice / ephemeral primitives -------------------------------------
+
+  /**
+   * Publish a pre-built event template as the active session, returning the
+   * signed event. Same machinery as `signAndPublish` but exposed for callers
+   * (e.g. voice presence beacons, gift-wrapped voice signaling) that need to
+   * publish events outside the NIP-29 group flow. Not part of the JS-exported
+   * `NostrBridge` surface; reach for it via `getBridgeImpl()`.
+   */
+  async publishEvent(template: {
+    kind: number;
+    content: string;
+    tags: string[][];
+    created_at?: number;
+  }, extraRelays: string[] = []): Promise<NostrEvent> {
+    return this.signAndPublish(
+      {
+        kind: template.kind,
+        content: template.content,
+        tags: template.tags,
+        created_at: template.created_at ?? Math.floor(Date.now() / 1000),
+      },
+      extraRelays,
+    );
+  }
+
+  /**
+   * Subscribe to events on the configured relays matching `filter`. Returns
+   * an unsubscribe function. NIP-42 auth is handled by the same signer the
+   * rest of the pool uses. Used by voice for presence beacons and incoming
+   * gift wraps. Filters apply per-relay; standard nostr-tools semantics.
+   */
+  subscribeFilter(filter: Filter, onEvent: (ev: NostrEvent) => void): () => void {
+    const sub = this.pool.subscribe(this.relays, filter, {
+      onevent: onEvent,
+      onauth: this.getAuthSigner(),
+    });
+    return () => sub.close();
+  }
+
   // -- Internals ---------------------------------------------------------
 
   /**
@@ -652,6 +816,35 @@ class BridgeImpl implements NostrBridge {
    * and pool.publish. When the relay sends CLOSED "auth-required:…" the pool
    * uses this to authenticate and retry the operation automatically.
    */
+  /**
+   * Sign an arbitrary event template with the active session's signer
+   * (nsec → finalizeEvent, nip07 → window.nostr.signEvent). Used by callers
+   * that need a signed event without publishing it — e.g. Blossom BUD-01
+   * upload-auth events that travel in the HTTP Authorization header.
+   */
+  async signEventTemplate(
+    template: { kind: number; content: string; tags: string[][]; created_at?: number },
+  ): Promise<NostrEvent> {
+    if (!this.session) throw new Error('Not logged in');
+    const fullTemplate = {
+      kind: template.kind,
+      content: template.content,
+      tags: template.tags,
+      created_at: template.created_at ?? Math.floor(Date.now() / 1000),
+      pubkey: this.session.pubKeyHex,
+    } as EventTemplate & { pubkey: string };
+    if (this.session.loginMethod === 'nsec' && this.session.privKeyHex) {
+      const sk = hexToBytes(this.session.privKeyHex);
+      return finalizeEvent(fullTemplate, sk) as NostrEvent;
+    }
+    if (this.session.loginMethod === 'nip07') {
+      const win = (window as any).nostr;
+      if (!win) throw new Error('NIP-07 extension unavailable');
+      return (await win.signEvent(fullTemplate)) as NostrEvent;
+    }
+    throw new Error(`Login method ${this.session.loginMethod} cannot sign events in this build`);
+  }
+
   private getAuthSigner(): ((evt: EventTemplate) => Promise<VerifiedEvent>) | undefined {
     if (!this.session) return undefined;
     return async (evt: EventTemplate): Promise<VerifiedEvent> => {
@@ -678,6 +871,8 @@ class BridgeImpl implements NostrBridge {
   }
 
   private subscribeGroupMessages(groupId: string): void {
+    if (this.messageSubscribedGroups.has(groupId)) return;
+    this.messageSubscribedGroups.add(groupId);
     const filter: Filter = {
       kinds: [KIND_GROUP_MESSAGE],
       '#h': [groupId],
@@ -728,6 +923,15 @@ class BridgeImpl implements NostrBridge {
   private ingestAdminMember(ev: NostrEvent): void {
     const groupId = ev.tags.find((t) => t[0] === 'd')?.[1];
     if (!groupId) return;
+    // Drop older revisions arriving out-of-order from slower relays. Without
+    // this, admins/members lists oscillate as different relays return
+    // different snapshots and the React UI flickers (gear icon disappears,
+    // members rail empties, etc.) until a refresh.
+    const cacheKey = `${ev.kind}:${groupId}`;
+    const prevAt = this.adminMemberLatestAt.get(cacheKey) ?? 0;
+    if (ev.created_at <= prevAt) return;
+    this.adminMemberLatestAt.set(cacheKey, ev.created_at);
+
     const pubkeys = ev.tags.filter((t) => t[0] === 'p').map((t) => t[1]);
     const store = ev.kind === KIND_GROUP_ADMINS ? this.adminsByGroup : this.membersByGroup;
     store.update((prev) => ({ ...prev, [groupId]: pubkeys }));
@@ -737,8 +941,18 @@ class BridgeImpl implements NostrBridge {
   private subscribeMyContactList(): void {
     if (!this.session) return;
     const filter: Filter = { kinds: [3], authors: [this.session.pubKeyHex], limit: 1 };
-    const sub = this.pool.subscribe(this.relays, filter, {
+    // Kind 3 (NIP-02 contact list) is rarely on the dex's NIP-29 relay —
+    // users publish it to their general-purpose relays (damus, nos.lol, …).
+    // Subscribing only on `this.relays` left the Follows tab perpetually
+    // empty for anyone whose contact list lives elsewhere.
+    const relays = Array.from(new Set([...this.relays, ...PROFILE_RELAYS]));
+    let latestCreatedAt = 0;
+    const sub = this.pool.subscribe(relays, filter, {
       onevent: (ev) => {
+        // Multiple relays may return different revisions of kind 3; keep the
+        // newest by created_at so an older replica doesn't clobber a newer one.
+        if (ev.created_at <= latestCreatedAt) return;
+        latestCreatedAt = ev.created_at;
         const pubkeys = ev.tags.filter((t) => t[0] === 'p').map((t) => t[1]);
         this.myFollows.set(pubkeys);
         pubkeys.forEach((pk) => this.ensureUserMetadata(pk));
@@ -762,6 +976,21 @@ class BridgeImpl implements NostrBridge {
       });
       this.subs.push(sub);
     }
+    // Wide-net pickup: other clients publish DMs to the user's own NIP-17
+    // (10050) inbox or NIP-65 (10002) read/write relays — not necessarily
+    // `this.relays`. Resolve those, then add a parallel subscription.
+    void this.fetchMyDmRelays().then((urls) => {
+      const extras = urls.filter((u) => !this.relays.includes(u));
+      if (extras.length === 0) return;
+      this.myDmRelays = extras;
+      for (const f of [filterIn, filterOut]) {
+        const sub = this.pool.subscribe(extras, f, {
+          onevent: (ev) => this.ingestIncomingDM(ev),
+          onauth: this.getAuthSigner(),
+        });
+        this.subs.push(sub);
+      }
+    });
   }
 
   private ingestGroupMetadata(ev: NostrEvent): void {
@@ -771,6 +1000,9 @@ class BridgeImpl implements NostrBridge {
     const isPublic = ev.tags.some((t) => t[0] === 'public');
     const isOpen = ev.tags.some((t) => t[0] === 'open');
     const parent = tag('parent') ?? null;
+    // `["t","voice"]` is the Obelisk voice-channel marker. Everything else
+    // defaults to `text` so existing groups keep working unchanged.
+    const isVoice = ev.tags.some((t) => t[0] === 't' && t[1] === 'voice');
     const next: JsGroup = {
       id: groupId,
       name: tag('name') ?? null,
@@ -780,11 +1012,15 @@ class BridgeImpl implements NostrBridge {
       isPublic,
       isOpen,
       parent,
+      kind: isVoice ? 'voice' : 'text',
     };
     this.groups.update((prev) => {
       const filtered = prev.filter((g) => g.id !== groupId);
       return [...filtered, next].sort((a, b) => (a.name ?? a.id).localeCompare(b.name ?? b.id));
     });
+    // Start streaming messages immediately so opening the channel doesn't
+    // wait on a fresh REQ round-trip — the store already has them.
+    this.subscribeGroupMessages(groupId);
     // Maintain parent → children index so the sidebar can render nesting.
     this.childrenByParent.update((prev) => {
       const next: Record<string, string[]> = { ...prev };
@@ -922,7 +1158,65 @@ class BridgeImpl implements NostrBridge {
     }
   }
 
-  private async signAndPublish(template: { kind: number; content: string; tags: string[][]; created_at: number }): Promise<NostrEvent> {
+  /**
+   * Look up a recipient's NIP-65 (kind 10002) read relays so we can publish
+   * DMs to relays they actually subscribe to. Cached per-pubkey for 6h.
+   * Returns an empty list on miss/timeout — caller falls back to `this.relays`.
+   */
+  private async fetchRecipientReadRelays(pubkey: string): Promise<string[]> {
+    const TTL_MS = 6 * 3600 * 1000;
+    const cached = this.recipientReadRelaysCache.get(pubkey);
+    if (cached && Date.now() - cached.fetchedAt < TTL_MS) return cached.relays;
+    const searchRelays = Array.from(new Set([...this.relays, ...PROFILE_RELAYS]));
+    let event: NostrEvent | null = null;
+    try {
+      event = await this.pool.get(searchRelays, { kinds: [10002], authors: [pubkey] }, { maxWait: 4000 });
+    } catch {
+      event = null;
+    }
+    const read = event ? parseRelayListMeta(event).read : [];
+    this.recipientReadRelaysCache.set(pubkey, { relays: read, fetchedAt: Date.now() });
+    return read;
+  }
+
+  /**
+   * Fetch the user's own kind 10050 (NIP-17 inbox) + kind 10002 (NIP-65)
+   * relay lists across a wide search net. Used after connect to extend the
+   * incoming-DM subscription onto the relays where other clients (Damus,
+   * Amethyst, Primal, …) actually deliver DMs addressed to us.
+   */
+  private async fetchMyDmRelays(): Promise<string[]> {
+    if (!this.session) return [];
+    const me = this.session.pubKeyHex;
+    const searchRelays = Array.from(new Set([...this.relays, ...PROFILE_RELAYS]));
+    const out = new Set<string>();
+    try {
+      const events = await this.pool.querySync(
+        searchRelays,
+        { kinds: [10002, 10050], authors: [me] },
+        { maxWait: 4000 },
+      );
+      // Pick the newest of each kind.
+      const newest = new Map<number, NostrEvent>();
+      for (const ev of events) {
+        const cur = newest.get(ev.kind);
+        if (!cur || ev.created_at > cur.created_at) newest.set(ev.kind, ev);
+      }
+      const meta = newest.get(10002);
+      if (meta) {
+        const { read, write } = parseRelayListMeta(meta);
+        read.forEach((u) => out.add(u));
+        write.forEach((u) => out.add(u));
+      }
+      const inbox = newest.get(10050);
+      if (inbox) parseInboxRelays(inbox).forEach((u) => out.add(u));
+    } catch {
+      // best-effort — fall through to whatever we have
+    }
+    return Array.from(out);
+  }
+
+  private async signAndPublish(template: { kind: number; content: string; tags: string[][]; created_at: number }, extraRelays: string[] = []): Promise<NostrEvent> {
     if (!this.session) throw new Error('Not logged in');
 
     let event: NostrEvent;
@@ -937,8 +1231,9 @@ class BridgeImpl implements NostrBridge {
       throw new Error(`Login method ${this.session.loginMethod} cannot sign events in this build`);
     }
 
+    const targetRelays = Array.from(new Set([...this.relays, ...extraRelays]));
     const results = await Promise.allSettled(
-      this.pool.publish(this.relays, event, { onauth: this.getAuthSigner() }),
+      this.pool.publish(targetRelays, event, { onauth: this.getAuthSigner() }),
     );
     const accepted = results.filter((r) => r.status === 'fulfilled');
     if (accepted.length === 0) {
@@ -946,7 +1241,7 @@ class BridgeImpl implements NostrBridge {
         .map((r, i) => {
           if (r.status === 'fulfilled') return null;
           const reason = r.reason instanceof Error ? r.reason.message : String(r.reason);
-          return `${this.relays[i]}: ${reason}`;
+          return `${targetRelays[i]}: ${reason}`;
         })
         .filter(Boolean)
         .join('; ');
@@ -1034,3 +1329,15 @@ export function getBridge(): Promise<NostrBridge> {
 export function getBridgeSync(): NostrBridge | null {
   return bridgeInstance;
 }
+
+/**
+ * Same as {@link getBridgeSync}, but returns the concrete `BridgeImpl` so
+ * callers can reach methods that aren't part of the WASM-mirrored
+ * `NostrBridge` surface — currently `publishEvent` / `subscribeFilter` for
+ * voice. Returns `null` if {@link getBridge} has not been awaited yet.
+ */
+export function getBridgeImpl(): BridgeImpl | null {
+  return bridgeInstance;
+}
+
+export type { BridgeImpl };

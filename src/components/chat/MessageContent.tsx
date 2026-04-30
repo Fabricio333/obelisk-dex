@@ -187,12 +187,13 @@ export default function MessageContent({ content, messageId, channelId }: { cont
   // Hoist image + video + audio URLs out of the message body so we can
   // render them as a gallery / inline player below the text. Without this,
   // each URL would render inline wherever it appears in the markdown.
-  const { imageUrls, videoUrls, audioUrls } = useMemo(() => {
+  const { imageUrls, videoUrls, audioUrls, youtubeUrls } = useMemo(() => {
     const urls = extractUrls(content);
     return {
       imageUrls: urls.filter(isImageUrl),
       videoUrls: urls.filter(isVideoUrl),
       audioUrls: urls.filter(isAudioUrl),
+      youtubeUrls: urls.filter((u) => !!extractYouTubeId(u)),
     };
   }, [content]);
 
@@ -214,7 +215,7 @@ export default function MessageContent({ content, messageId, channelId }: { cont
   }, [content]);
 
   const bodyContent = useMemo(() => {
-    const toStrip = [...imageUrls, ...videoUrls, ...audioUrls];
+    const toStrip = [...imageUrls, ...videoUrls, ...audioUrls, ...youtubeUrls];
     let stripped = content;
     if (welcomeBanner) stripped = stripped.split(welcomeBanner.raw).join('');
     for (const url of toStrip) {
@@ -225,7 +226,7 @@ export default function MessageContent({ content, messageId, channelId }: { cont
     }
     // collapse stray whitespace/newlines left behind
     return stripped.replace(/\n{3,}/g, '\n\n').trim();
-  }, [content, imageUrls, videoUrls, audioUrls, welcomeBanner, invoices]);
+  }, [content, imageUrls, videoUrls, audioUrls, youtubeUrls, welcomeBanner, invoices]);
 
   // Resolve `:name:` shortcodes before markdown parsing. Unicode shortcodes
   // are replaced inline (no placeholder — the char is just a char), while
@@ -306,11 +307,9 @@ export default function MessageContent({ content, messageId, channelId }: { cont
         return <AttachmentCard url={href} name={filenameFromUrl(href)} />;
       }
 
-      // YouTube URL — render only the embed, suppress raw URL text
-      const ytId = extractYouTubeId(href);
-      if (ytId) {
-        return <YouTubeEmbed videoId={ytId} />;
-      }
+      // YouTube URL — raw pastes are hoisted out of the body and rendered
+      // as a real embed. Explicit `[label](yt-url)` markdown links fall
+      // through to a plain link so we never put a <div> inside <p>.
 
       // Same-origin /chat?c=<slug>[&m=|&p=] links render as a Discord-style
       // pill (#slug, with ↩ prefix for deep-links to specific messages or
@@ -414,6 +413,12 @@ export default function MessageContent({ content, messageId, channelId }: { cont
       )}
       {/* Image matrix hoisted out of the body text */}
       {imageUrls.length > 0 && <ImageGallery urls={imageUrls} />}
+      {/* YouTube embeds hoisted so they render outside the markdown <p>
+          (the player swaps in a <div> on click, which is invalid inside <p>) */}
+      {youtubeUrls.map((url) => {
+        const id = extractYouTubeId(url);
+        return id ? <YouTubeEmbed key={url} videoId={id} /> : null;
+      })}
       {/* Videos: inline native player, one per video */}
       {videoUrls.map((url) => (
         <video

@@ -11,7 +11,7 @@
  *   • New-account flow generates a fresh nsec via nostr-tools.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { generateSecretKey, getPublicKey, nip19 } from 'nostr-tools';
 import { nostrActions, decodeNsec } from '@/lib/nostr-bridge';
 
@@ -22,7 +22,6 @@ export default function LoginModal({ onSuccess }: { onSuccess?: () => void } = {
   const [method, setMethod] = useState<LoginMethod | null>(null);
   const [nsecInput, setNsecInput] = useState('');
   const [bunkerInput, setBunkerInput] = useState('');
-  const [hasNip07, setHasNip07] = useState(false);
   const [bunkerTab, setBunkerTab] = useState<BunkerTab>('qr');
   const [loadingMethod, setLoadingMethod] = useState<LoginMethod | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -30,13 +29,6 @@ export default function LoginModal({ onSuccess }: { onSuccess?: () => void } = {
   const [nsecCopied, setNsecCopied] = useState(false);
   const [creatingAccount, setCreatingAccount] = useState(false);
   const [backupConfirmed, setBackupConfirmed] = useState(false);
-
-  useEffect(() => {
-    const check = () => setHasNip07(typeof window !== 'undefined' && !!(window as any).nostr);
-    check();
-    const t = setTimeout(check, 500);
-    return () => clearTimeout(t);
-  }, []);
 
   const isLoading = loadingMethod !== null || creatingAccount;
 
@@ -88,7 +80,7 @@ export default function LoginModal({ onSuccess }: { onSuccess?: () => void } = {
       setNewAccountNsec(nsec);
       const skHex = Array.from(sk).map((b) => b.toString(16).padStart(2, '0')).join('');
       // Stash the keypair so the "Continue" button can log in immediately.
-      sessionStorage.setItem('obeliskord/pending-new-account', JSON.stringify({ skHex, pkHex: pk }));
+      sessionStorage.setItem('obelisk-dex/pending-new-account', JSON.stringify({ skHex, pkHex: pk }));
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create account');
     } finally {
@@ -114,7 +106,7 @@ export default function LoginModal({ onSuccess }: { onSuccess?: () => void } = {
 
   const handleDownloadNsec = useCallback(() => {
     if (!newAccountNsec) return;
-    const content = `Obeliskord — Nostr Private Key Backup
+    const content = `Obelisk-dex — Nostr Private Key Backup
 
 Keep this file safe and secret. Anyone with this key controls your account. There is no recovery if you lose it.
 
@@ -125,7 +117,7 @@ ${newAccountNsec}
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'obeliskord-nsec-backup.txt';
+    a.download = 'obelisk-dex-nsec-backup.txt';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -133,11 +125,13 @@ ${newAccountNsec}
   }, [newAccountNsec]);
 
   const handleContinueAfterBackup = useCallback(async () => {
-    const raw = sessionStorage.getItem('obeliskord/pending-new-account');
+    const raw = sessionStorage.getItem('obelisk-dex/pending-new-account')
+      ?? sessionStorage.getItem('obeliskord/pending-new-account');
     if (!raw) return;
     try {
       const { skHex, pkHex } = JSON.parse(raw) as { skHex: string; pkHex: string };
       await nostrActions.loginWithNsec(skHex, pkHex);
+      sessionStorage.removeItem('obelisk-dex/pending-new-account');
       sessionStorage.removeItem('obeliskord/pending-new-account');
       onSuccess?.();
     } catch (err) {
@@ -248,7 +242,7 @@ ${newAccountNsec}
 
         ) : !method ? (
           <div className="space-y-3">
-            {hasNip07 && (
+            {(
               <button
                 onClick={() => handleLogin('extension')}
                 disabled={isLoading}

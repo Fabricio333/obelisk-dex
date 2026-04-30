@@ -1,17 +1,16 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useDMStore } from '@/store/dm';
 import { useAuthStore } from '@/store/auth';
 import { npubToHex, formatPubkey } from '@/lib/nostr';
-import { useProfile, useNostrQuery } from '@/lib/nostr-hooks';
-import type { UserSearchResult } from '@/app/api/users/search/route';
+import { useProfile } from '@/lib/nostr-hooks';
+import { useNostrUserSearch, type UserHit } from '@/lib/hooks/useNostrUserSearch';
 
 interface DMComposerProps {
   onClose: () => void;
   /** Optional fallback display name/picture for direct-paste pubkeys that
-   *  haven't shown up on relays yet. Mirrors the legacy `profileCache` map
-   *  the modal used to take. */
+   *  haven't shown up on relays yet. */
   profileCache?: Map<string, { name?: string; picture?: string }>;
 }
 
@@ -22,66 +21,8 @@ interface RowProfile {
   nip05?: string | null;
 }
 
-const SEARCH_DEBOUNCE_MS = 250;
-// NIP-50 search isn't universally supported; query a couple of indexers in
-// parallel so a flaky single relay doesn't silently kill the whole feature.
-const NIP50_RELAYS = [
-  'wss://relay.nostr.band',
-  'wss://relay.noswhere.com',
-  'wss://search.nos.today',
-];
-
 function resolveToHex(input: string): string | null {
   return input.trim() ? npubToHex(input) : null;
-}
-
-function parseKind0Content(raw: string): { name?: string; displayName?: string; picture?: string; nip05?: string } {
-  try {
-    const r = JSON.parse(raw);
-    return {
-      name: r.name,
-      displayName: r.displayName ?? r.display_name,
-      picture: r.picture ?? r.image,
-      nip05: r.nip05,
-    };
-  } catch {
-    return {};
-  }
-}
-
-const NIP05_RE = /^([a-z0-9._-]+)@([a-z0-9.-]+\.[a-z]{2,})$/i;
-
-interface Nip05Hit {
-  pubkey: string;
-  identifier: string;
-}
-
-async function resolveNip05(identifier: string, signal: AbortSignal): Promise<Nip05Hit | null> {
-  const m = NIP05_RE.exec(identifier.trim());
-  if (!m) return null;
-  const [, name, domain] = m;
-  try {
-    const res = await fetch(
-      `https://${domain}/.well-known/nostr.json?name=${encodeURIComponent(name)}`,
-      { signal, mode: 'cors' },
-    );
-    if (!res.ok) return null;
-    const data = (await res.json()) as { names?: Record<string, string> };
-    const pk = data.names?.[name] ?? data.names?.[name.toLowerCase()];
-    if (typeof pk !== 'string' || !/^[0-9a-f]{64}$/i.test(pk)) return null;
-    return { pubkey: pk.toLowerCase(), identifier };
-  } catch {
-    return null;
-  }
-}
-
-function useDebounced<T>(value: T, delayMs: number): T {
-  const [debounced, setDebounced] = useState(value);
-  useEffect(() => {
-    const t = setTimeout(() => setDebounced(value), delayMs);
-    return () => clearTimeout(t);
-  }, [value, delayMs]);
-  return debounced;
 }
 
 function ResultRow({
@@ -139,101 +80,22 @@ export default function DMComposer({ onClose, profileCache }: DMComposerProps) {
   const partnerHex = useMemo(() => resolveToHex(pubkey), [pubkey]);
   const profileEntry = useProfile(myPubkey, partnerHex);
 
-  const trimmed = pubkey.trim();
-  const debouncedQuery = useDebounced(trimmed, SEARCH_DEBOUNCE_MS);
-  const searchEnabled = debouncedQuery.length >= 2 && !partnerHex;
-
-  const [obeliskResults, setObeliskResults] = useState<UserSearchResult[]>([]);
-  const [obeliskLoading, setObeliskLoading] = useState(false);
-  const [nip05Hit, setNip05Hit] = useState<Nip05Hit | null>(null);
-  const [nip05Loading, setNip05Loading] = useState(false);
-
-  // Treat `name@domain.tld` as a NIP-05 lookup. We resolve it via the
-  // standard `.well-known/nostr.json` endpoint — that's the only way to
-  // pull the hex pubkey for a NIP-05 the local DB doesn't know about, and
-  // NIP-50 free-text search on relays is unreliable for nip-05 strings.
-  useEffect(() => {
-    setNip05Hit(null);
-    if (!searchEnabled || !NIP05_RE.test(debouncedQuery)) {
-      setNip05Loading(false);
-      return;
-    }
-    const ac = new AbortController();
-    setNip05Loading(true);
-    resolveNip05(debouncedQuery, ac.signal).then((hit) => {
-      if (ac.signal.aborted) return;
-      setNip05Hit(hit);
-      setNip05Loading(false);
-    });
-    return () => { ac.abort(); setNip05Loading(false); };
-  }, [debouncedQuery, searchEnabled]);
+  // Reuse the standards-only Nostr search hook (NIP-19 / NIP-05 / NIP-50).
+  // The hook handles its own debounce and skips when the input is already
+  // a parseable identity, so we just feed it the raw text.
+  const { nip05Hit, nostrResults, loading: searchLoading } = useNostrUserSearch(pubkey);
 
   // Pull the kind-0 profile for a resolved NIP-05 hit so we can render an
   // avatar + display name instead of just the bare pubkey.
   const nip05Profile = useProfile(myPubkey, nip05Hit?.pubkey ?? null);
 
-  useEffect(() => {
-    if (!searchEnabled) {
-      setObeliskResults([]);
-      setObeliskLoading(false);
-      return;
-    }
-    let cancelled = false;
-    setObeliskLoading(true);
-    fetch(`/api/users/search?q=${encodeURIComponent(debouncedQuery)}`, {
-      credentials: 'same-origin',
-    })
-      .then((res) => (res.ok ? res.json() : Promise.reject(new Error('search failed'))))
-      .then((data: { results: UserSearchResult[] }) => {
-        if (cancelled) return;
-        setObeliskResults(data.results ?? []);
-        setObeliskLoading(false);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setObeliskResults([]);
-        setObeliskLoading(false);
-      });
-    return () => { cancelled = true; };
-  }, [debouncedQuery, searchEnabled]);
+  const showSearchSections = pubkey.trim().length >= 2 && !partnerHex;
 
-  const nostrFilters = useMemo(
-    () => (searchEnabled ? [{ kinds: [0], search: debouncedQuery, limit: 10 }] : []),
-    [debouncedQuery, searchEnabled],
-  );
-  const { events: nostrEvents, loading: nostrLoading } = useNostrQuery(nostrFilters, {
-    enabled: searchEnabled,
-    relays: NIP50_RELAYS,
-    // NIP-50 indexers can be slow on cold connect; give them headroom before
-    // we declare "no relay matches yet" instead of "still searching".
-    timeoutMs: 10000,
-  });
-
-  const obeliskPubkeys = useMemo(
-    () => new Set(obeliskResults.map((r) => r.pubkey)),
-    [obeliskResults],
-  );
-
-  const nostrResults = useMemo<RowProfile[]>(() => {
-    const out: RowProfile[] = [];
-    const seen = new Set<string>();
-    for (const ev of nostrEvents) {
-      if (ev.kind !== 0) continue;
-      if (seen.has(ev.pubkey)) continue;
-      if (obeliskPubkeys.has(ev.pubkey)) continue;
-      if (myPubkey && ev.pubkey === myPubkey) continue;
-      seen.add(ev.pubkey);
-      const parsed = parseKind0Content(ev.content);
-      out.push({
-        pubkey: ev.pubkey,
-        displayName: parsed.displayName ?? parsed.name ?? null,
-        picture: parsed.picture ?? null,
-        nip05: parsed.nip05 ?? null,
-      });
-      if (out.length >= 10) break;
-    }
-    return out;
-  }, [nostrEvents, obeliskPubkeys, myPubkey]);
+  const filteredNostrResults = useMemo<RowProfile[]>(() => {
+    return nostrResults
+      .filter((r) => !myPubkey || r.pubkey !== myPubkey)
+      .filter((r) => r.pubkey !== nip05Hit?.pubkey);
+  }, [nostrResults, myPubkey, nip05Hit]);
 
   const startChatWith = (pk: string, profile?: { displayName?: string | null; picture?: string | null }) => {
     addThread({
@@ -248,9 +110,6 @@ export default function DMComposer({ onClose, profileCache }: DMComposerProps) {
 
   const handleStart = () => {
     const pk = resolveToHex(pubkey);
-    // Enter is a no-op when the input isn't a parseable pubkey — the user is
-    // probably mid-search. The Start button is only rendered next to a valid
-    // preview row, so reaching this branch via the button is impossible.
     if (!pk) return;
     const liveParsed = partnerHex === pk ? profileEntry?.parsed : undefined;
     const legacy = profileCache?.get(pk);
@@ -263,23 +122,19 @@ export default function DMComposer({ onClose, profileCache }: DMComposerProps) {
   const previewName = previewParsed?.displayName ?? previewParsed?.name;
   const previewPicture = previewParsed?.picture;
 
-  const showSearchSections = searchEnabled;
-  const nip05Row: RowProfile | null = nip05Hit && !obeliskPubkeys.has(nip05Hit.pubkey)
+  const nip05Row: RowProfile | null = nip05Hit
     ? {
         pubkey: nip05Hit.pubkey,
         displayName: nip05Profile?.parsed?.displayName ?? nip05Profile?.parsed?.name ?? null,
         picture: nip05Profile?.parsed?.picture ?? null,
-        nip05: nip05Hit.identifier,
+        nip05: nip05Hit.nip05,
       }
     : null;
   const noResults =
     showSearchSections &&
-    !obeliskLoading &&
-    !nostrLoading &&
-    !nip05Loading &&
+    !searchLoading &&
     !nip05Row &&
-    obeliskResults.length === 0 &&
-    nostrResults.length === 0;
+    filteredNostrResults.length === 0;
 
   return (
     <div
@@ -339,68 +194,37 @@ export default function DMComposer({ onClose, profileCache }: DMComposerProps) {
 
       {showSearchSections && (
         <div className="max-h-72 overflow-y-auto px-2 pt-1 pb-2 border-t border-lc-border bg-lc-black/30" data-testid="dm-search-results">
-          {(nip05Loading || nip05Row) && (
+          {nip05Row && (
             <section className="mb-2" data-testid="dm-search-nip05-section">
               <header className="flex items-center justify-between px-1 mb-1">
                 <span className="text-[10px] font-semibold uppercase tracking-wider text-lc-muted">
                   NIP-05 lookup
                 </span>
-                {nip05Loading && (
-                  <span className="text-[10px] text-lc-muted">Resolving…</span>
-                )}
               </header>
-              {nip05Row && (
-                <ResultRow
-                  profile={nip05Row}
-                  badge="NIP-05"
-                  onClick={() => startChatWith(nip05Row.pubkey, { displayName: nip05Row.displayName, picture: nip05Row.picture })}
-                />
-              )}
+              <ResultRow
+                profile={nip05Row}
+                badge="NIP-05"
+                onClick={() => startChatWith(nip05Row.pubkey, { displayName: nip05Row.displayName, picture: nip05Row.picture })}
+              />
             </section>
           )}
-          <section className="mb-2">
-            <header className="flex items-center justify-between px-1 mb-1">
-              <span className="text-[10px] font-semibold uppercase tracking-wider text-lc-muted">
-                On Obelisk
-              </span>
-              {obeliskLoading && (
-                <span className="text-[10px] text-lc-muted" data-testid="dm-search-obelisk-loading">
-                  Searching…
-                </span>
-              )}
-            </header>
-            {obeliskResults.length === 0 && !obeliskLoading ? (
-              <p className="px-1 text-xs text-lc-muted">No matches in this instance</p>
-            ) : (
-              <div className="flex flex-col" data-testid="dm-search-obelisk-results">
-                {obeliskResults.map((r) => (
-                  <ResultRow
-                    key={`obelisk-${r.pubkey}`}
-                    profile={r}
-                    badge="On Obelisk"
-                    onClick={() => startChatWith(r.pubkey, { displayName: r.displayName, picture: r.picture })}
-                  />
-                ))}
-              </div>
-            )}
-          </section>
 
           <section>
             <header className="flex items-center justify-between px-1 mb-1">
               <span className="text-[10px] font-semibold uppercase tracking-wider text-lc-muted">
                 On Nostr
               </span>
-              {nostrLoading && (
+              {searchLoading && (
                 <span className="text-[10px] text-lc-muted" data-testid="dm-search-nostr-loading">
                   Searching…
                 </span>
               )}
             </header>
-            {nostrResults.length === 0 && !nostrLoading ? (
+            {filteredNostrResults.length === 0 && !searchLoading ? (
               <p className="px-1 text-xs text-lc-muted">No relay matches yet</p>
             ) : (
               <div className="flex flex-col" data-testid="dm-search-nostr-results">
-                {nostrResults.map((r) => (
+                {filteredNostrResults.map((r) => (
                   <ResultRow
                     key={`nostr-${r.pubkey}`}
                     profile={r}

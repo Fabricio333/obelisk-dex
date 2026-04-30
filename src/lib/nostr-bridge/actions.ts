@@ -21,8 +21,8 @@ export const nostrActions = {
   addRelay: async (url: string) => (await getBridge()).addRelay(url),
   removeRelay: async (url: string) => (await getBridge()).removeRelay(url),
 
-  sendMessage: async (groupId: string, content: string) =>
-    (await getBridge()).sendMessage(groupId, content),
+  sendMessage: async (groupId: string, content: string, replyTo?: { id: string; pubkey: string } | null) =>
+    (await getBridge()).sendMessage(groupId, content, replyTo),
   sendReaction: async (targetEventId: string, targetPubkey: string, emoji: string, groupId: string) =>
     (await getBridge()).sendReaction(targetEventId, targetPubkey, emoji, groupId),
   sendDirectMessage: async (recipientPubkey: string, content: string) =>
@@ -55,4 +55,8 @@ export const nostrActions = {
   searchMessages: async (
     opts: Parameters<Awaited<ReturnType<typeof getBridge>>['searchMessages']>[0],
   ) => (await getBridge()).searchMessages(opts),
+
+  signEventTemplate: async (
+    template: Parameters<Awaited<ReturnType<typeof getBridge>>['signEventTemplate']>[0],
+  ) => (await getBridge()).signEventTemplate(template),
 };

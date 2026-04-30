@@ -1,29 +1,22 @@
 #!/usr/bin/env bash
-# One-shot dev raise: Docker + db + dev server + Cloudflare tunnel.
+# Dev raise: `next dev` + Cloudflare tunnel.
 #
-# Idempotent: starts Docker (Colima/OrbStack/Desktop), Postgres + LiveKit,
-# Next.js dev server, and the named cloudflared tunnel only if each piece
-# isn't already running. Re-running is safe and cheap.
-#
-# Cloudflared output is redirected to ./tunnel.log (kept off stdout).
+# Idempotent: reuses an existing dev server / cloudflared if already running.
+# Re-running is safe.
 #
 #   ./scripts/dev-raise.sh
 #
 # Env overrides:
-#   TUNNEL_NAME        default: obelisk
-#   TUNNEL_HOSTNAME    default: obelisk.fabri.lat
+#   TUNNEL_NAME        default: obelisk-dex
+#   TUNNEL_HOSTNAME    default: dex-test.obelisk.ar
 #   PORT               default: 3000
-#   PORT_FALLBACK_MAX  default: 10  (how many ports to probe above $PORT)
-#   ORIGIN_URL         default: https://127.0.0.1:$PORT
-#   SKIP_LIVEKIT=1     don't bring up livekit container
-#   SKIP_TUNNEL=1      only start db + dev server, no cloudflared
-#   FORCE_KILL=1       non-interactive: kill unknown processes on $PORT
-#                      (otherwise we fall back to the next free port)
+#   PORT_FALLBACK_MAX  default: 10
+#   ORIGIN_URL         default: http://127.0.0.1:$PORT
+#   SKIP_TUNNEL=1      only start dev server, no cloudflared
+#   FORCE_KILL=1       kill anything on $PORT instead of falling back
 
 set -u
 
-# Load project .env so TUNNEL_HOSTNAME / DATABASE_URL / etc. don't have
-# to be re-typed on every invocation. Existing shell vars take precedence.
 if [ -f "$(dirname "$0")/../.env" ]; then
   set -a
   # shellcheck disable=SC1091
@@ -31,27 +24,21 @@ if [ -f "$(dirname "$0")/../.env" ]; then
   set +a
 fi
 
-TUNNEL_NAME="${TUNNEL_NAME:-obelisk}"
-TUNNEL_HOST="${TUNNEL_HOSTNAME:-obelisk.fabri.lat}"
+TUNNEL_NAME="${TUNNEL_NAME:-obelisk-dex}"
+TUNNEL_HOST="${TUNNEL_HOSTNAME:-dex-test.obelisk.ar}"
+ORIGIN_CERT="${CLOUDFLARED_ORIGIN_CERT:-$HOME/.cloudflared/cert.pem}"
 PORT="${PORT:-3000}"
 PORT_FALLBACK_MAX="${PORT_FALLBACK_MAX:-10}"
-# Stash an explicit override so a later port-shift fallback (see below)
-# can still honor it; if unset we'll auto-detect the scheme from cert.pem.
 ORIGIN_URL_OVERRIDE="${ORIGIN_URL:-}"
-# server.ts switches to HTTPS only when both cert.pem + key.pem exist in
-# the project root. Auto-pick the matching origin scheme so cloudflared
-# doesn't try to TLS-handshake an HTTP server (or vice-versa). Override
-# with ORIGIN_URL=... if you bind a different host:port.
-_PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-if [ -f "$_PROJECT_ROOT/cert.pem" ] && [ -f "$_PROJECT_ROOT/key.pem" ]; then
-  _DEFAULT_SCHEME="https"
-else
-  _DEFAULT_SCHEME="http"
-fi
-ORIGIN_URL="${ORIGIN_URL_OVERRIDE:-${_DEFAULT_SCHEME}://127.0.0.1:${PORT}}"
-SKIP_LIVEKIT="${SKIP_LIVEKIT:-0}"
+ORIGIN_URL="${ORIGIN_URL_OVERRIDE:-http://127.0.0.1:${PORT}}"
 SKIP_TUNNEL="${SKIP_TUNNEL:-0}"
 FORCE_KILL="${FORCE_KILL:-0}"
+# Turbopack on Next 16.2.2 panics with "Next.js package not found" and the
+# browser falls back to a full reload loop. Default to webpack until the
+# Turbopack regression is fixed upstream. Flip with USE_TURBOPACK=1.
+USE_TURBOPACK="${USE_TURBOPACK:-0}"
+# Wipe .next before starting (cheap insurance against corrupted cache).
+CLEAN_NEXT_CACHE="${CLEAN_NEXT_CACHE:-1}"
 
 cd "$(dirname "$0")/.."
 
@@ -59,101 +46,25 @@ red()   { printf "\033[0;31m%s\033[0m\n" "$*"; }
 green() { printf "\033[0;32m%s\033[0m\n" "$*"; }
 blue()  { printf "\033[0;34m%s\033[0m\n" "$*"; }
 dim()   { printf "\033[2m%s\033[0m\n"     "$*"; }
-
-step() { printf "\n\033[1;36m▸ %s\033[0m\n" "$*"; }
+step()  { printf "\n\033[1;36m▸ %s\033[0m\n" "$*"; }
 
 # ── Pre-flight ───────────────────────────────────────────────────
 step "Pre-flight"
-command -v docker >/dev/null || { red "docker CLI not installed."; exit 1; }
+command -v node >/dev/null || { red "node not installed."; exit 1; }
+command -v npm  >/dev/null || { red "npm not installed."; exit 1; }
 if [ "$SKIP_TUNNEL" != "1" ]; then
   command -v cloudflared >/dev/null || { red "cloudflared not installed. brew install cloudflared"; exit 1; }
-  [ -f "$HOME/.cloudflared/cert.pem" ] || { red "Not logged in. Run: cloudflared tunnel login"; exit 1; }
+  [ -f "$ORIGIN_CERT" ] || { red "Origin cert missing: $ORIGIN_CERT"; red "Run: cloudflared tunnel login (or set CLOUDFLARED_ORIGIN_CERT)"; exit 1; }
+  dim "Origin cert: $ORIGIN_CERT"
 fi
-
-if docker compose version >/dev/null 2>&1; then
-  DC="docker compose"
-elif command -v docker-compose >/dev/null 2>&1; then
-  DC="docker-compose"
-else
-  red "docker compose not available."; exit 1
-fi
-
-# ── Docker daemon ────────────────────────────────────────────────
-step "Docker daemon"
-if docker info >/dev/null 2>&1; then
-  green "Docker already running."
-else
-  blue "Docker not running — starting a runtime…"
-  started=0
-  if command -v colima >/dev/null 2>&1; then
-    blue "Starting colima (this can take ~30s the first time)…"
-    if colima start; then started=1; fi
-  elif [ -d "/Applications/OrbStack.app" ]; then
-    open -a OrbStack && started=1
-  elif [ -d "/Applications/Docker.app" ]; then
-    open -a Docker && started=1
-  fi
-  [ "$started" = "1" ] || { red "No Docker runtime (Colima/OrbStack/Docker Desktop) found or failed to launch."; exit 1; }
-  for i in $(seq 1 60); do
-    if docker info >/dev/null 2>&1; then green "Docker is up."; started=ok; break; fi
-    sleep 2
-  done
-  [ "${started:-}" = "ok" ] || { red "Docker didn't become ready within 120s."; exit 1; }
-fi
-
-# ── Dev services (db, livekit) ───────────────────────────────────
-step "Dev services (Postgres${SKIP_LIVEKIT:+ only})"
-services="db"
-[ "$SKIP_LIVEKIT" = "1" ] || services="db livekit"
-
-blue "Bringing up: $services"
-# shellcheck disable=SC2086
-$DC -f docker-compose.dev.yml up -d $services >/dev/null
-
-blue "Waiting for Postgres to accept connections…"
-for i in $(seq 1 30); do
-  if $DC -f docker-compose.dev.yml exec -T db pg_isready -U obelisk >/dev/null 2>&1; then
-    green "Postgres ready."
-    break
-  fi
-  sleep 2
-  if [ "$i" = "30" ]; then
-    red "Postgres didn't become ready in time."
-    $DC -f docker-compose.dev.yml logs --tail 30 db || true
-    exit 1
-  fi
-done
-
-# ── Prisma migrations ────────────────────────────────────────────
-step "Prisma migrations"
-# Use the dev DB URL the compose file defines. Override with DATABASE_URL
-# in your shell/.env if your setup differs.
-export DATABASE_URL="${DATABASE_URL:-postgresql://obelisk:obelisk@127.0.0.1:5432/obelisk}"
-
-migrate_status=$(npx --no-install prisma migrate status 2>&1 || true)
-if printf "%s" "$migrate_status" | grep -qE "Database schema is up to date|No migration found in prisma/migrations"; then
-  green "Schema up to date."
-elif printf "%s" "$migrate_status" | grep -qE "have not yet been applied|following migrations? have not been applied|drift detected|Database schema is not in sync"; then
-  blue "Applying pending migrations…"
-  if ! npx --no-install prisma migrate deploy; then
-    red "prisma migrate deploy failed."
-    exit 1
-  fi
-  green "Migrations applied."
-else
-  # Unknown state (e.g. shadow DB issues) — surface it but don't block.
-  dim "prisma migrate status:"
-  printf "%s\n" "$migrate_status" | sed 's/^/  /'
-  blue "Attempting migrate deploy anyway…"
-  npx --no-install prisma migrate deploy || red "migrate deploy reported issues — continuing."
-fi
+green "OK."
 
 # ── Tunnel lookup ────────────────────────────────────────────────
 TUNNEL_UUID=""
 CRED_FILE=""
 if [ "$SKIP_TUNNEL" != "1" ]; then
   step "Tunnel lookup"
-  TUNNEL_UUID=$(cloudflared tunnel list 2>/dev/null | awk -v n="$TUNNEL_NAME" '$2==n {print $1}')
+  TUNNEL_UUID=$(cloudflared --origincert "$ORIGIN_CERT" tunnel list 2>/dev/null | awk -v n="$TUNNEL_NAME" '$2==n {print $1}')
   if [ -z "$TUNNEL_UUID" ]; then
     red "Tunnel '$TUNNEL_NAME' not found."
     echo "Create it with:"
@@ -163,27 +74,16 @@ if [ "$SKIP_TUNNEL" != "1" ]; then
   fi
   CRED_FILE="$HOME/.cloudflared/${TUNNEL_UUID}.json"
   [ -f "$CRED_FILE" ] || { red "Missing credentials file: $CRED_FILE"; exit 1; }
-  dim "UUID: $TUNNEL_UUID"
+  dim "UUID: $TUNNEL_UUID  →  $TUNNEL_HOST"
 fi
 
 # ── Port check ───────────────────────────────────────────────────
 step "Dev server on port $PORT"
 DEV_ALREADY_RUNNING=0
 
-port_holder_cmd() {
-  local p="$1"
-  local pid
-  pid=$(lsof -tiTCP:"$p" -sTCP:LISTEN 2>/dev/null | head -1 || true)
-  [ -z "$pid" ] && return 0
-  ps -p "$pid" -o command= 2>/dev/null || true
-}
-
-is_obelisk_dev() {
-  # Only reuse our custom HTTPS-capable server (tsx watch server.ts).
-  # A plain `next dev` / next-server listens on HTTP and breaks the
-  # https://127.0.0.1:$PORT origin that cloudflared expects.
+is_next_dev() {
   case "$1" in
-    *"tsx watch server.ts"*|*"server.ts"*) return 0 ;;
+    *"next dev"*|*"next-server"*|*"node "*"next"*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -192,117 +92,118 @@ pids=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
 
 if [ -n "$pids" ]; then
   cmd=$(ps -p "$(echo "$pids" | head -1)" -o command= 2>/dev/null || true)
-  if is_obelisk_dev "$cmd"; then
-    green "Dev server already listening on $PORT — reusing (pid $(echo "$pids" | head -1))."
+  if is_next_dev "$cmd"; then
+    green "Dev server already on $PORT — reusing (pid $(echo "$pids" | head -1))."
     DEV_ALREADY_RUNNING=1
   else
-    blue "Port $PORT held by unrelated process(es): $pids"
-    for pid in $pids; do ps -p "$pid" -o pid=,command= 2>/dev/null || true; done
-
+    blue "Port $PORT held by: $cmd"
     if [ "$FORCE_KILL" = "1" ]; then
-      blue "FORCE_KILL=1 — killing holders on $PORT."
+      blue "FORCE_KILL=1 — killing."
       kill $pids 2>/dev/null || true; sleep 1
       still=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
-      [ -n "$still" ] && { red "Force-killing: $still"; kill -9 $still 2>/dev/null || true; sleep 1; }
-      still=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
-      [ -n "$still" ] && { red "Port $PORT still in use. Aborting."; exit 1; }
-      green "Port $PORT freed."
+      [ -n "$still" ] && { kill -9 $still 2>/dev/null || true; sleep 1; }
     else
-      # Fallback: probe the next N ports for a free one (or an existing
-      # Obelisk dev server we can reuse).
       blue "Probing fallback ports $((PORT+1))..$((PORT+PORT_FALLBACK_MAX))"
       found=""
       for off in $(seq 1 "$PORT_FALLBACK_MAX"); do
         cand=$((PORT + off))
         cpids=$(lsof -tiTCP:"$cand" -sTCP:LISTEN 2>/dev/null || true)
         if [ -z "$cpids" ]; then
-          found="$cand"
-          green "Using free port $cand."
-          PORT="$cand"
-          break
+          found="$cand"; PORT="$cand"; green "Using free port $cand."; break
         fi
         ccmd=$(ps -p "$(echo "$cpids" | head -1)" -o command= 2>/dev/null || true)
-        if is_obelisk_dev "$ccmd"; then
-          green "Obelisk dev already listening on $cand — reusing (pid $(echo "$cpids" | head -1))."
-          PORT="$cand"
-          DEV_ALREADY_RUNNING=1
-          found="$cand"
+        if is_next_dev "$ccmd"; then
+          PORT="$cand"; DEV_ALREADY_RUNNING=1; found="$cand"
+          green "Next dev already on $cand — reusing."
           break
         fi
       done
-      if [ -z "$found" ]; then
-        red "No free port in $PORT..$((PORT+PORT_FALLBACK_MAX)). Free one up or set FORCE_KILL=1."
-        exit 1
-      fi
+      [ -z "$found" ] && { red "No free port. Set FORCE_KILL=1."; exit 1; }
     fi
   fi
 fi
 
-# Recompute ORIGIN_URL now that PORT may have shifted. Honor an explicit
-# override if the user set ORIGIN_URL=...; otherwise reuse the cert.pem-
-# derived scheme detected at startup.
-ORIGIN_URL="${ORIGIN_URL_OVERRIDE:-${_DEFAULT_SCHEME}://127.0.0.1:${PORT}}"
+ORIGIN_URL="${ORIGIN_URL_OVERRIDE:-http://127.0.0.1:${PORT}}"
 export PORT
 
-# ── Launch / reuse dev + tunnel ──────────────────────────────────
+# ── Launch ───────────────────────────────────────────────────────
 DEV_PID=""
 TUNNEL_PID=""
 TUNNEL_REUSED=0
 
+CLEANED_UP=0
 cleanup() {
+  [ "$CLEANED_UP" = "1" ] && return
+  CLEANED_UP=1
   echo
   blue "Shutting down…"
   if [ "$TUNNEL_REUSED" = "0" ] && [ -n "$TUNNEL_PID" ]; then
-    kill "$TUNNEL_PID" 2>/dev/null || true
+    kill -TERM "$TUNNEL_PID" 2>/dev/null
+    # cloudflared spawns child quic workers — kill the whole tree
+    pkill -TERM -P "$TUNNEL_PID" 2>/dev/null
   fi
   if [ "$DEV_ALREADY_RUNNING" = "0" ] && [ -n "$DEV_PID" ]; then
-    kill "$DEV_PID" 2>/dev/null || true
+    kill -TERM "$DEV_PID" 2>/dev/null
+    pkill -TERM -P "$DEV_PID" 2>/dev/null
   fi
-  wait 2>/dev/null || true
+  # Give them up to 2s to exit cleanly, then SIGKILL anything still alive.
+  for _ in 1 2 3 4; do
+    alive=0
+    [ -n "$TUNNEL_PID" ] && kill -0 "$TUNNEL_PID" 2>/dev/null && alive=1
+    [ -n "$DEV_PID" ] && kill -0 "$DEV_PID" 2>/dev/null && alive=1
+    [ "$alive" = "0" ] && break
+    sleep 0.5
+  done
+  [ -n "$TUNNEL_PID" ] && kill -KILL "$TUNNEL_PID" 2>/dev/null
+  [ -n "$DEV_PID" ] && kill -KILL "$DEV_PID" 2>/dev/null
+  # Catch any orphaned grandchildren (next-server, cloudflared workers).
+  pkill -KILL -P $$ 2>/dev/null
+  return 0
 }
-trap cleanup INT TERM EXIT
+on_signal() { cleanup; exit 130; }
+trap on_signal INT TERM
+trap cleanup EXIT
 
 if [ "$DEV_ALREADY_RUNNING" = "0" ]; then
-  blue "Starting npm run dev (logs → ./dev.log)…"
-  npm run dev > dev.log 2>&1 &
+  if [ "$CLEAN_NEXT_CACHE" = "1" ] && [ -d .next ]; then
+    dim "Wiping .next cache (set CLEAN_NEXT_CACHE=0 to skip)…"
+    rm -rf .next
+  fi
+  DEV_FLAGS="-p $PORT"
+  if [ "$USE_TURBOPACK" != "1" ]; then
+    DEV_FLAGS="$DEV_FLAGS --webpack"
+    blue "Starting next dev on :$PORT (webpack — set USE_TURBOPACK=1 to opt in to Turbopack) (logs → ./dev.log)…"
+  else
+    blue "Starting next dev on :$PORT (turbopack) (logs → ./dev.log)…"
+  fi
+  # shellcheck disable=SC2086
+  PORT="$PORT" npx next dev $DEV_FLAGS > dev.log 2>&1 &
   DEV_PID=$!
   for i in $(seq 1 60); do
-    if lsof -iTCP:"$PORT" -sTCP:LISTEN -n -P >/dev/null 2>&1; then
-      green "Dev server up."
-      break
-    fi
+    lsof -iTCP:"$PORT" -sTCP:LISTEN -n -P >/dev/null 2>&1 && { green "Dev server up."; break; }
     if ! kill -0 "$DEV_PID" 2>/dev/null; then
-      red "npm run dev died early. Last 20 log lines:"
-      tail -20 dev.log
-      exit 1
+      red "next dev died. Last 20 log lines:"; tail -20 dev.log; exit 1
     fi
     sleep 1
   done
-  if ! lsof -iTCP:"$PORT" -sTCP:LISTEN -n -P >/dev/null 2>&1; then
-    red "Dev server didn't start within 60s. See dev.log"
-    exit 1
-  fi
+  lsof -iTCP:"$PORT" -sTCP:LISTEN -n -P >/dev/null 2>&1 || { red "Dev server didn't start within 60s. See dev.log"; exit 1; }
 fi
 
 if [ "$SKIP_TUNNEL" = "1" ]; then
   step "Ready"
-  green "Dev server: http://127.0.0.1:$PORT  (SKIP_TUNNEL=1)"
-  if [ "$DEV_ALREADY_RUNNING" = "0" ]; then
-    blue "Tailing dev.log — Ctrl-C to stop."
-    while kill -0 "$DEV_PID" 2>/dev/null; do sleep 5; done
-  fi
+  green "Dev: http://127.0.0.1:$PORT  (SKIP_TUNNEL=1)"
+  [ "$DEV_ALREADY_RUNNING" = "0" ] && { blue "Tailing — Ctrl-C to stop."; while kill -0 "$DEV_PID" 2>/dev/null; do sleep 5; done; }
   exit 0
 fi
 
 step "Cloudflare tunnel"
-# Detect any running cloudflared for this tunnel (by UUID or by name).
 if pgrep -f "cloudflared .* ${TUNNEL_UUID}" >/dev/null 2>&1 \
    || pgrep -f "cloudflared .* ${TUNNEL_NAME}\b" >/dev/null 2>&1; then
-  green "Tunnel '$TUNNEL_NAME' already running — reusing (logs wherever it was started)."
+  green "Tunnel '$TUNNEL_NAME' already running — reusing."
   TUNNEL_REUSED=1
 else
   blue "Starting cloudflared '$TUNNEL_NAME' → $ORIGIN_URL (logs → ./tunnel.log)"
-  cloudflared tunnel \
+  cloudflared --origincert "$ORIGIN_CERT" tunnel \
     --config /dev/null \
     --cred-file "$CRED_FILE" \
     run \
@@ -310,13 +211,96 @@ else
     --no-tls-verify \
     "$TUNNEL_UUID" > tunnel.log 2>&1 &
   TUNNEL_PID=$!
-  # Give it a moment to either connect or die noisily.
   sleep 2
   if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-    red "cloudflared died on startup. Last 20 log lines:"
-    tail -20 tunnel.log
+    red "cloudflared died. Last 20 log lines:"; tail -20 tunnel.log; exit 1
+  fi
+fi
+
+# Wait for cloudflared to register all 4 edge connections (means tunnel
+# is actually carrying traffic, not just a process that's alive).
+step "Tunnel handshake"
+ready=0
+for i in $(seq 1 30); do
+  if grep -q "Registered tunnel connection" tunnel.log 2>/dev/null; then
+    n=$(grep -c "Registered tunnel connection" tunnel.log 2>/dev/null || echo 0)
+    [ "$n" -ge 1 ] && { green "cloudflared registered $n edge connection(s)."; ready=1; break; }
+  fi
+  if grep -qiE "error|failed|unauthorized|ingress" tunnel.log 2>/dev/null \
+     && ! grep -q "Registered tunnel connection" tunnel.log 2>/dev/null; then
+    red "cloudflared reported errors. Last 30 log lines:"; tail -30 tunnel.log
     exit 1
   fi
+  sleep 1
+done
+if [ "$ready" != "1" ]; then
+  red "cloudflared didn't register an edge connection within 30s."
+  red "Last 30 log lines:"; tail -30 tunnel.log
+  exit 1
+fi
+
+# Verify the public hostname actually serves our origin (catches the
+# "tunnel up but DNS / ingress route points elsewhere" case).
+step "Public reachability"
+
+probe_public() {
+  # Resolve via a public resolver to bypass local/ISP negative-cache
+  # for newly-created CNAMEs. curl's -w always prints %{http_code}
+  # (000 on failure); don't append a fallback or we get "000000".
+  local ip
+  ip=$(dig +short +time=2 +tries=1 "$TUNNEL_HOST" @1.1.1.1 | grep -m1 -E '^[0-9.]+$')
+  if [ -n "$ip" ]; then
+    curl -sk -o /dev/null -w "%{http_code}" --max-time 5 \
+      --resolve "${TUNNEL_HOST}:443:${ip}" "https://$TUNNEL_HOST"
+  else
+    curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "https://$TUNNEL_HOST"
+  fi
+}
+
+wait_public() {
+  local attempts="$1" code=""
+  for _ in $(seq 1 "$attempts"); do
+    code=$(probe_public)
+    case "$code" in
+      2*|3*|401|403) echo "$code"; return 0 ;;
+      530|521|522|523|525) dim "edge $code (origin not reachable yet) — retrying…" ;;
+      000) dim "no response — retrying…" ;;
+      *)   dim "got $code — retrying…" ;;
+    esac
+    sleep 2
+  done
+  echo "$code"
+  return 1
+}
+
+if code=$(wait_public 20); then
+  green "https://$TUNNEL_HOST responding ($code)."
+else
+  blue "Public hostname not responding (last code: $code) — attempting DNS route fix…"
+  if cloudflared --origincert "$ORIGIN_CERT" tunnel route dns --overwrite-dns "$TUNNEL_UUID" "$TUNNEL_HOST" >>tunnel.log 2>&1; then
+    green "Re-routed $TUNNEL_HOST → $TUNNEL_NAME. Re-checking…"
+    if code=$(wait_public 20); then
+      green "https://$TUNNEL_HOST responding ($code)."
+    else
+      red "Still no response after DNS route (last code: $code)."
+    fi
+  else
+    red "DNS route command failed — see tunnel.log."
+  fi
+
+  case "$code" in
+    2*|3*|401|403) ;;
+    *)
+      red "https://$TUNNEL_HOST not serving content (last code: $code)."
+      red "Likely causes:"
+      red "  • Another cloudflared instance owns this hostname"
+      red "    check: pgrep -af cloudflared"
+      red "  • Origin scheme mismatch (try ORIGIN_URL=https://127.0.0.1:$PORT)"
+      red "  • DNS propagation lag (wait a minute and re-run)"
+      red "Tunnel log tail:"; tail -20 tunnel.log
+      exit 1
+      ;;
+  esac
 fi
 
 step "Ready"
@@ -325,7 +309,7 @@ green "Public: https://$TUNNEL_HOST"
 dim   "Logs:   ./dev.log  ./tunnel.log"
 echo
 
-# Block until something relevant exits.
+PANIC_WARNED=0
 while :; do
   if [ "$TUNNEL_REUSED" = "0" ] && [ -n "$TUNNEL_PID" ] && ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
     red "Tunnel exited."; break
@@ -335,6 +319,17 @@ while :; do
   fi
   if [ "$DEV_ALREADY_RUNNING" = "0" ] && [ -n "$DEV_PID" ] && ! kill -0 "$DEV_PID" 2>/dev/null; then
     red "Dev server exited."; break
+  fi
+  # Surface bundler panics once — they cause the browser to full-reload
+  # in a loop. The user has to take action (wipe cache / switch bundler).
+  if [ "$PANIC_WARNED" = "0" ] && grep -qE "FATAL|Turbopack error|panic log has been written" dev.log 2>/dev/null; then
+    red "⚠ Bundler panic detected in dev.log — browser will reload-loop."
+    if [ "$USE_TURBOPACK" = "1" ]; then
+      red "  Re-run without USE_TURBOPACK=1 to fall back to webpack."
+    else
+      red "  Try: rm -rf .next node_modules/.cache && npm run dev:raise"
+    fi
+    PANIC_WARNED=1
   fi
   sleep 2
 done

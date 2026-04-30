@@ -29,7 +29,7 @@ let pool: SimplePool | null = null;
  * touches them. SimplePool's constructor accepts a `websocketImpl`
  * option for exactly this kind of injection.
  */
-class TextCoercingWebSocket extends WebSocket {
+export class TextCoercingWebSocket extends WebSocket {
   constructor(url: string | URL, protocols?: string | string[]) {
     super(url, protocols);
     this.binaryType = 'arraybuffer';

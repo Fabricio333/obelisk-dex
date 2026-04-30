@@ -21,6 +21,13 @@ export interface JsGroup {
   readonly isPublic: boolean;
   readonly isOpen: boolean;
   readonly parent: string | null;
+  /**
+   * `'voice'` when the group's kind 39000 metadata carries a `["t","voice"]`
+   * tag — see `src/lib/voice/`. Otherwise `'text'`. We piggyback on the
+   * existing NIP-29 metadata flow so a voice channel is "just a group with
+   * a voice marker"; the relay needs no special handling.
+   */
+  readonly kind: 'text' | 'voice';
 }
 
 export interface JsMessage {
@@ -107,7 +114,28 @@ export interface NostrBridge {
   /** NIP-02 kind 3 follows for the local user. */
   subscribeMyFollows(cb: (pubkeys: ReadonlyArray<string>) => void): Unsubscribe;
 
-  sendMessage(groupId: string, content: string): Promise<void>;
+  /**
+   * Sign an event template with the active session's signer without
+   * publishing it. Intended for HTTP-side flows like Blossom BUD-01 upload
+   * auth (kind 24242) where the signed event is passed in the Authorization
+   * header rather than to a relay.
+   */
+  signEventTemplate(template: {
+    kind: number;
+    content: string;
+    tags: string[][];
+    created_at?: number;
+  }): Promise<{
+    id: string;
+    pubkey: string;
+    kind: number;
+    content: string;
+    tags: string[][];
+    created_at: number;
+    sig: string;
+  }>;
+
+  sendMessage(groupId: string, content: string, replyTo?: { id: string; pubkey: string } | null): Promise<void>;
   sendReaction(targetEventId: string, targetPubkey: string, emoji: string, groupId: string): Promise<void>;
   sendDirectMessage(recipientPubkey: string, content: string): Promise<void>;
   joinGroup(groupId: string): Promise<void>;
@@ -131,6 +159,8 @@ export interface NostrBridge {
     banner?: string;
     isPublic?: boolean;
     isOpen?: boolean;
+    /** When `'voice'`, includes a `["t","voice"]` marker on the kind 9002 metadata so the channel renders as a voice/video room. See `src/lib/voice/`. */
+    kind?: 'text' | 'voice';
   }): Promise<string>;
   editGroupMetadata(opts: {
     groupId: string;
@@ -141,6 +171,8 @@ export interface NostrBridge {
     banner?: string;
     isPublic?: boolean;
     isOpen?: boolean;
+    /** Toggle a channel between text and voice. Adds or omits the `["t","voice"]` marker on the kind 9002 metadata; the relay reflects it on kind 39000 like any other tag. */
+    kind?: 'text' | 'voice';
   }): Promise<void>;
   /**
    * NIP-50 search against the active relay(s). Builds a single `REQ` filter

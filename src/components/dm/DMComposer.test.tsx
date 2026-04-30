@@ -139,78 +139,40 @@ describe('DMComposer profile preview', () => {
 
 describe('DMComposer directory search', () => {
   const myPubkey = 'c'.repeat(64);
-  const obeliskPubkey = 'a'.repeat(64);
   const nostrPubkey = 'b'.repeat(64);
-  const fetchMock = vi.fn();
+  const otherPubkey = 'd'.repeat(64);
 
   beforeEach(() => {
     useDMStore.setState(useDMStore.getInitialState());
     _resetProfileCache();
     enqueueMock.mockClear();
     querySyncMock.mockReset();
-    fetchMock.mockReset();
     localStorage.clear();
     useAuthStore.setState({
       ...useAuthStore.getState(),
       profile: { pubkey: myPubkey, name: 'Me', displayName: 'Me' } as unknown as never,
     });
-    (globalThis as any).fetch = fetchMock;
   });
 
-  afterEach(() => {
-    delete (globalThis as any).fetch;
-  });
-
-  function jsonResponse(body: unknown) {
-    return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
-  }
-
-  it('runs DB and Nostr searches in parallel after a debounce', async () => {
-    fetchMock.mockReturnValue(jsonResponse({ results: [] }));
+  it('runs a NIP-50 kind:0 search after a debounce against multiple indexer relays', async () => {
     querySyncMock.mockResolvedValue([]);
 
     render(<DMComposer onClose={vi.fn()} />);
     fireEvent.change(screen.getByTestId('new-dm-pubkey-input'), { target: { value: 'al' } });
 
     await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith(
-        '/api/users/search?q=al',
-        expect.objectContaining({ credentials: 'same-origin' }),
-      );
+      expect(querySyncMock).toHaveBeenCalled();
     });
-    expect(querySyncMock).toHaveBeenCalledTimes(1);
     const [filters, opts] = querySyncMock.mock.calls[0];
     expect(filters).toEqual([{ kinds: [0], search: 'al', limit: 10 }]);
-    // Multiple NIP-50 indexers in parallel for resilience.
     expect(opts.relays).toEqual(expect.arrayContaining(['wss://relay.nostr.band']));
     expect(opts.relays.length).toBeGreaterThan(1);
   });
 
-  it('renders Obelisk results with the "On Obelisk" badge', async () => {
-    fetchMock.mockReturnValue(jsonResponse({
-      results: [{ pubkey: obeliskPubkey, displayName: 'Alice', picture: null, nip05: 'alice@example.com' }],
-    }));
-    querySyncMock.mockResolvedValue([]);
-
-    render(<DMComposer onClose={vi.fn()} />);
-    fireEvent.change(screen.getByTestId('new-dm-pubkey-input'), { target: { value: 'alice' } });
-
-    await waitFor(() => {
-      expect(screen.getByTestId('dm-search-obelisk-results')).toBeInTheDocument();
-    });
-    expect(screen.getByText('Alice')).toBeInTheDocument();
-    const obeliskRow = screen.getByTestId('dm-search-obelisk-results')
-      .querySelector('[data-testid="dm-search-result"]') as HTMLElement;
-    expect(obeliskRow.textContent).toContain('On Obelisk');
-  });
-
-  it('renders Nostr results and dedupes pubkeys already in the Obelisk section', async () => {
-    fetchMock.mockReturnValue(jsonResponse({
-      results: [{ pubkey: obeliskPubkey, displayName: 'Alice', picture: null, nip05: null }],
-    }));
+  it('renders Nostr kind:0 results in the "On Nostr" section', async () => {
     querySyncMock.mockResolvedValue([
-      { id: '1', kind: 0, pubkey: obeliskPubkey, created_at: 1, tags: [], sig: 'x', content: '{"name":"Alice"}' },
-      { id: '2', kind: 0, pubkey: nostrPubkey, created_at: 2, tags: [], sig: 'x', content: '{"name":"Bob","picture":"p"}' },
+      { id: '1', kind: 0, pubkey: nostrPubkey, created_at: 1, tags: [], sig: 'x', content: '{"name":"Alice","picture":"p"}' },
+      { id: '2', kind: 0, pubkey: otherPubkey, created_at: 2, tags: [], sig: 'x', content: '{"name":"Bob"}' },
     ]);
 
     render(<DMComposer onClose={vi.fn()} />);
@@ -219,45 +181,60 @@ describe('DMComposer directory search', () => {
     await waitFor(() => {
       expect(screen.getByTestId('dm-search-nostr-results')).toBeInTheDocument();
     });
-
-    const nostrSection = screen.getByTestId('dm-search-nostr-results');
-    expect(nostrSection.querySelectorAll('[data-testid="dm-search-result"]').length).toBe(1);
-    expect(nostrSection.textContent).toContain('Bob');
+    const section = screen.getByTestId('dm-search-nostr-results');
+    expect(section.querySelectorAll('[data-testid="dm-search-result"]').length).toBe(2);
+    expect(section.textContent).toContain('Alice');
+    expect(section.textContent).toContain('Bob');
   });
 
-  it('clicking an Obelisk result starts a DM with that pubkey and closes the composer', async () => {
+  it('clicking a Nostr result starts a DM with that pubkey and closes the composer', async () => {
     const onClose = vi.fn();
-    fetchMock.mockReturnValue(jsonResponse({
-      results: [{ pubkey: obeliskPubkey, displayName: 'Alice', picture: null, nip05: null }],
-    }));
-    querySyncMock.mockResolvedValue([]);
+    querySyncMock.mockResolvedValue([
+      { id: '1', kind: 0, pubkey: nostrPubkey, created_at: 1, tags: [], sig: 'x', content: '{"name":"Alice"}' },
+    ]);
 
     render(<DMComposer onClose={onClose} />);
     fireEvent.change(screen.getByTestId('new-dm-pubkey-input'), { target: { value: 'alice' } });
 
     await waitFor(() => {
-      expect(screen.getByTestId('dm-search-obelisk-results')).toBeInTheDocument();
+      expect(screen.getByTestId('dm-search-nostr-results')).toBeInTheDocument();
     });
 
-    const row = screen.getByTestId('dm-search-obelisk-results')
+    const row = screen.getByTestId('dm-search-nostr-results')
       .querySelector('[data-testid="dm-search-result"]') as HTMLElement;
     fireEvent.click(row);
 
-    expect(useDMStore.getState().activeDMPubkey).toBe(obeliskPubkey);
+    expect(useDMStore.getState().activeDMPubkey).toBe(nostrPubkey);
     expect(onClose).toHaveBeenCalled();
   });
 
+  it('filters out the current user from Nostr results', async () => {
+    querySyncMock.mockResolvedValue([
+      { id: '1', kind: 0, pubkey: myPubkey, created_at: 1, tags: [], sig: 'x', content: '{"name":"Me"}' },
+      { id: '2', kind: 0, pubkey: nostrPubkey, created_at: 2, tags: [], sig: 'x', content: '{"name":"Alice"}' },
+    ]);
+
+    render(<DMComposer onClose={vi.fn()} />);
+    fireEvent.change(screen.getByTestId('new-dm-pubkey-input'), { target: { value: 'alice' } });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('dm-search-nostr-results')).toBeInTheDocument();
+    });
+    const section = screen.getByTestId('dm-search-nostr-results');
+    expect(section.querySelectorAll('[data-testid="dm-search-result"]').length).toBe(1);
+    expect(section.textContent).toContain('Alice');
+    expect(section.textContent).not.toContain('Me');
+  });
+
   it('does not run the search when the input parses as a valid npub', async () => {
-    fetchMock.mockReturnValue(jsonResponse({ results: [] }));
     querySyncMock.mockResolvedValue([]);
 
-    const npub = nip19.npubEncode(obeliskPubkey);
+    const npub = nip19.npubEncode(nostrPubkey);
     render(<DMComposer onClose={vi.fn()} />);
     fireEvent.change(screen.getByTestId('new-dm-pubkey-input'), { target: { value: npub } });
 
     await new Promise((r) => setTimeout(r, 350));
 
-    expect(fetchMock).not.toHaveBeenCalled();
     expect(querySyncMock).not.toHaveBeenCalled();
     expect(screen.queryByTestId('dm-search-results')).not.toBeInTheDocument();
   });

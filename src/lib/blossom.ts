@@ -1,10 +1,9 @@
 'use client';
 
-import { getNDK } from '@/lib/nostr';
-import { NDKEvent } from '@nostr-dev-kit/ndk';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { KIND_BLOSSOM_AUTH } from '@/lib/nip-kinds';
+import { nostrActions } from '@/lib/nostr-bridge';
 
 const BLOSSOM_SERVERS = [
   'https://blossom.primal.net',
@@ -13,21 +12,19 @@ const BLOSSOM_SERVERS = [
 ];
 
 async function createAuthEvent(fileHash: string): Promise<string> {
-  const ndk = getNDK();
-  if (!ndk.signer) throw new Error('No signer available');
-
-  const event = new NDKEvent(ndk);
-  event.kind = KIND_BLOSSOM_AUTH;
-  event.content = '';
-  event.tags = [
-    ['t', 'upload'],
-    ['x', fileHash],
-    ['expiration', String(Math.floor(Date.now() / 1000) + 3600)],
-  ];
-  await event.sign();
-
-  const raw = JSON.stringify(event.rawEvent());
-  return btoa(raw);
+  // BUD-01: kind 24242 with `t=upload`, `x=<sha256-hex>`, `expiration` tags.
+  // Signed with the active session's signer (nsec / NIP-07 via the bridge —
+  // not NDK, which isn't wired in the Nostr-only build).
+  const event = await nostrActions.signEventTemplate({
+    kind: KIND_BLOSSOM_AUTH,
+    content: '',
+    tags: [
+      ['t', 'upload'],
+      ['x', fileHash],
+      ['expiration', String(Math.floor(Date.now() / 1000) + 3600)],
+    ],
+  });
+  return btoa(JSON.stringify(event));
 }
 
 export async function uploadToBlossom(file: File): Promise<string> {

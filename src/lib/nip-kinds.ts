@@ -37,3 +37,29 @@ export const KIND_BLOSSOM_AUTH = 24242;
 
 /** NIP-98 — HTTP auth event (used by backend challenge/response). */
 export const KIND_HTTP_AUTH = 27235;
+
+/**
+ * Obelisk voice — ephemeral presence beacon for voice-channel rosters.
+ * Re-published every ~15s while a peer is in a voice channel; tagged with
+ * `["e", channelId]` and `["expiration", now+30]` so any compliant relay
+ * drops it shortly after the peer leaves. See docs/webrtc-p2p-nostr-signaling.md.
+ */
+export const KIND_VOICE_PRESENCE = 20078;
+
+/**
+ * Obelisk voice — signaling event (offer / answer / ICE / bye) directed at a
+ * specific peer via `["p", recipientPubkey]`. v1 ships these as plaintext
+ * signed ephemeral events (kind in 2xxxx range, relays don't persist) — the
+ * channel id and recipient are already public to relay subscribers, and SDP
+ * payloads aren't privacy-sensitive. Future versions may upgrade to NIP-59
+ * gift-wrapped rumors once we have a NIP-07-compatible NIP-44 path.
+ */
+export const KIND_VOICE_SIGNAL = 25050;
+
+/**
+ * Obelisk voice — moderator force action (mute / camera-off / screen-off)
+ * targeting another participant. Same plaintext-ephemeral wire as
+ * `KIND_VOICE_SIGNAL`; receivers verify the signer's pubkey is a channel
+ * admin/owner before acting on it.
+ */
+export const KIND_VOICE_MOD_ACTION = 25051;

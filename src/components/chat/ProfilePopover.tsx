@@ -1,12 +1,14 @@
 'use client';
 
-import { Fragment, useEffect, useRef, type ReactNode } from 'react';
+import { Fragment, useEffect, useMemo, useRef, type ReactNode } from 'react';
 import { useChatStore } from '@/store/chat';
 import { useToastStore } from '@/store/toast';
 import { useModerationStore } from '@/store/moderation';
 import { useAuthStore } from '@/store/auth';
 import { formatPubkey, pubkeyToNpub } from '@/lib/nostr';
 import { nip19 } from 'nostr-tools';
+import { useUserMetadata } from '@/lib/nostr-bridge';
+import type { MemberInfo } from '@/lib/mentions';
 import {
   replaceShortcodes,
   CUSTOM_EMOJI_PLACEHOLDER_REGEX,
@@ -78,7 +80,25 @@ export default function ProfilePopover({ pubkey, onClose }: {
   onClose: () => void;
 }) {
   const { memberList, serverEmojis } = useChatStore();
-  const member = memberList.find((m) => m.pubkey === pubkey);
+  const memberFromList = memberList.find((m) => m.pubkey === pubkey);
+  // For arbitrary pubkeys (e.g. the search-bar dropdown), the active server's
+  // memberList won't have an entry. Fall back to live Nostr kind:0 metadata so
+  // the popover still renders avatar/name/nip05/about/website/lud16/banner.
+  const meta = useUserMetadata(pubkey);
+  const member = useMemo<MemberInfo | undefined>(() => {
+    if (memberFromList) return memberFromList;
+    if (!meta) return undefined;
+    return {
+      pubkey,
+      displayName: meta.displayName ?? meta.name ?? formatPubkey(pubkey),
+      picture: meta.picture ?? undefined,
+      banner: meta.banner ?? undefined,
+      nip05: meta.nip05 ?? undefined,
+      about: meta.about ?? undefined,
+      website: meta.website ?? undefined,
+      lud16: meta.lud16 ?? undefined,
+    };
+  }, [memberFromList, meta, pubkey]);
   const panelRef = useRef<HTMLDivElement>(null);
   const viewerPubkey = useAuthStore((s) => s.user?.pubkey);
   const isSelf = viewerPubkey === pubkey;

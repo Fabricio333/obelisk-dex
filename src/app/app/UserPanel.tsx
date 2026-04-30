@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { nip19 } from 'nostr-tools';
 import { nostrActions, useUserMetadata } from '@/lib/nostr-bridge';
+import BlossomImageInput from '@/components/BlossomImageInput';
 
 interface UserPanelProps {
   pubkey: string;
@@ -264,8 +265,27 @@ function EditProfileForm({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const firstField = useRef<HTMLInputElement>(null);
+  // Track whether the user has typed into any field. Once true, we stop
+  // overwriting their edits when fresh kind:0 metadata arrives from a relay.
+  const dirtyRef = useRef(false);
+  const markDirty = () => { dirtyRef.current = true; };
 
   useEffect(() => { firstField.current?.focus(); }, []);
+
+  // Hydrate fields when metadata arrives. The editor often opens before the
+  // bridge has the kind:0 cached (cold relay or first paint), so `initial`
+  // is null on mount and the fields stay empty until the user refreshes.
+  // Re-syncing whenever `initial` changes fills them in as soon as the
+  // metadata lands — without clobbering whatever the user has already typed.
+  useEffect(() => {
+    if (!initial || dirtyRef.current) return;
+    setName(initial.displayName || initial.name || '');
+    setAbout(initial.about || '');
+    setPicture(initial.picture || '');
+    setBanner(initial.banner || '');
+    setNip05(initial.nip05 || '');
+    setWebsite(initial.website || '');
+  }, [initial]);
 
   const save = async () => {
     if (!name.trim()) { setError('Name is required'); return; }
@@ -294,22 +314,29 @@ function EditProfileForm({
   return (
     <div className="space-y-3 p-4">
       <Field label="Name">
-        <input ref={firstField} value={name} onChange={(e) => setName(e.target.value)} className={fieldCls} />
+        <input ref={firstField} value={name} onChange={(e) => { markDirty(); setName(e.target.value); }} className={fieldCls} />
       </Field>
       <Field label="About">
-        <textarea value={about} onChange={(e) => setAbout(e.target.value)} rows={2} className={fieldCls} />
+        <textarea value={about} onChange={(e) => { markDirty(); setAbout(e.target.value); }} rows={2} className={fieldCls} />
       </Field>
-      <Field label="Picture URL">
-        <input value={picture} onChange={(e) => setPicture(e.target.value)} placeholder="https://…" className={fieldCls} />
-      </Field>
-      <Field label="Banner URL">
-        <input value={banner} onChange={(e) => setBanner(e.target.value)} placeholder="https://…" className={fieldCls} />
-      </Field>
+      <BlossomImageInput
+        label="Picture"
+        value={picture}
+        onChange={(url) => { markDirty(); setPicture(url); }}
+        shape="square"
+      />
+      <BlossomImageInput
+        label="Banner"
+        value={banner}
+        onChange={(url) => { markDirty(); setBanner(url); }}
+        shape="wide"
+        accept="image/*"
+      />
       <Field label="NIP-05">
-        <input value={nip05} onChange={(e) => setNip05(e.target.value)} placeholder="you@example.com" className={fieldCls} />
+        <input value={nip05} onChange={(e) => { markDirty(); setNip05(e.target.value); }} placeholder="you@example.com" className={fieldCls} />
       </Field>
       <Field label="Website">
-        <input value={website} onChange={(e) => setWebsite(e.target.value)} placeholder="https://…" className={fieldCls} />
+        <input value={website} onChange={(e) => { markDirty(); setWebsite(e.target.value); }} placeholder="https://…" className={fieldCls} />
       </Field>
       {error && <div className="text-xs text-red-400">{error}</div>}
       <div className="flex gap-2 pt-1">

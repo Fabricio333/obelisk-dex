@@ -17,10 +17,15 @@ import {
   nostrActions,
   useGroups,
   useUserMetadata,
+  type JsGroup,
   type JsMessage,
 } from '@/lib/nostr-bridge';
+import { useNostrUserSearch, type UserHit } from '@/lib/hooks/useNostrUserSearch';
+import { searchGroups } from '@/lib/group-search';
+import { formatPubkey } from '@/lib/nostr';
+import ProfilePopover from '@/components/chat/ProfilePopover';
 
-const HISTORY_KEY = 'obeliskord/search-history';
+const HISTORY_KEY = 'obelisk-dex/search-history';
 const HISTORY_MAX = 10;
 
 interface ParsedQuery {
@@ -109,6 +114,9 @@ export default function SearchBar({
   const [results, setResults] = useState<ReadonlyArray<JsMessage & { groupId: string | null }>>([]);
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<string[]>([]);
+  // Lifted to the root so the popover survives the dropdown unmount that
+  // happens when we close the search panel after selecting a user.
+  const [previewPubkey, setPreviewPubkey] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => { setHistory(loadHistory()); }, [open]);
@@ -189,14 +197,21 @@ export default function SearchBar({
             />
           ) : (
             <ResultsPane
+              raw={raw}
+              parsed={parseQuery(raw)}
               busy={busy}
               error={error}
               results={results}
               onPickFilter={applyFilter}
               onJump={(m) => { onJump?.(m); setOpen(false); }}
+              onClose={() => setOpen(false)}
+              onPreviewUser={(pk) => { setPreviewPubkey(pk); setOpen(false); }}
             />
           )}
         </div>
+      )}
+      {previewPubkey && (
+        <ProfilePopover pubkey={previewPubkey} onClose={() => setPreviewPubkey(null)} />
       )}
     </div>
   );
@@ -258,26 +273,149 @@ function FilterRow({ icon, title, hint, onClick }: { icon: string; title: string
   );
 }
 
-function ResultsPane({ busy, error, results, onPickFilter, onJump }: {
+function ResultsPane({ raw, parsed, busy, error, results, onPickFilter, onJump, onClose, onPreviewUser }: {
+  raw: string;
+  parsed: ParsedQuery;
   busy: boolean;
   error: string | null;
   results: ReadonlyArray<JsMessage & { groupId: string | null }>;
   onPickFilter: (token: string) => void;
   onJump: (m: JsMessage & { groupId: string | null }) => void;
+  onClose: () => void;
+  onPreviewUser: (pubkey: string) => void;
 }) {
+  // When the user is composing a structured token query (`from:`, `in:`,
+  // `mentions:`, `has:`), they're searching messages — hide the entity
+  // sections to avoid noise. Otherwise show Users + Channels alongside
+  // Messages so a single bar covers all three discovery paths.
+  // Detect structured tokens on the raw text — even an unresolved `from:foo`
+  // means the user is composing a message-search query, so we should hide
+  // entity sections rather than try to NIP-50-search the literal token.
+  const hasStructuredTokens = /(^|\s)(from|in|mentions|has):/i.test(raw);
+  const showEntities = !hasStructuredTokens && raw.trim().length >= 1;
+  const userQuery = showEntities ? parsed.query : '';
+
   return (
     <>
+      {showEntities && <UsersSection query={userQuery} onPreviewUser={onPreviewUser} />}
+      {showEntities && <ChannelsSection query={userQuery} onClose={onClose} />}
       <div className="flex items-center gap-2 px-3 py-2 text-[11px] font-bold uppercase tracking-wider text-lc-muted border-b border-lc-border">
-        <span>{busy ? 'Buscando…' : `Resultados · ${results.length}`}</span>
+        <span data-testid="search-messages-header">{busy ? 'Buscando mensajes…' : `Mensajes · ${results.length}`}</span>
       </div>
       {error && <div className="px-3 py-2 text-xs text-red-400">{error}</div>}
       {!busy && results.length === 0 && !error && (
-        <div className="px-3 py-6 text-center text-sm text-lc-muted">
-          Sin resultados. Probá con otros filtros (from:, in:, mentions:, has:).
+        <div className="px-3 py-3 text-center text-xs text-lc-muted">
+          Pulsá Enter para buscar mensajes. Probá filtros (from:, in:, mentions:, has:).
         </div>
       )}
       {results.map((m) => <ResultRow key={m.id} msg={m} onJump={() => onJump(m)} onAuthor={(pk) => onPickFilter(`from:${pk}`)} />)}
     </>
+  );
+}
+
+function UsersSection({ query, onPreviewUser }: { query: string; onPreviewUser: (pubkey: string) => void }) {
+  const { directHit, nip05Hit, nostrResults, loading } = useNostrUserSearch(query);
+
+  const rows: Array<{ key: string; hit: UserHit; badge?: string }> = [];
+  if (directHit) rows.push({ key: `direct-${directHit.pubkey}`, hit: directHit, badge: 'npub' });
+  if (nip05Hit && nip05Hit.pubkey !== directHit?.pubkey) {
+    rows.push({ key: `nip05-${nip05Hit.pubkey}`, hit: nip05Hit, badge: 'NIP-05' });
+  }
+  for (const r of nostrResults) {
+    if (r.pubkey === directHit?.pubkey || r.pubkey === nip05Hit?.pubkey) continue;
+    rows.push({ key: `nostr-${r.pubkey}`, hit: r });
+  }
+
+  return (
+    <section data-testid="search-users-section">
+      <div className="flex items-center justify-between px-3 py-2 text-[11px] font-bold uppercase tracking-wider text-lc-muted border-b border-lc-border">
+        <span>Usuarios</span>
+        {loading && <span className="text-[10px] normal-case font-normal text-lc-muted">Buscando…</span>}
+      </div>
+      {rows.length === 0 && !loading && (
+        <div className="px-3 py-2 text-xs text-lc-muted">Sin coincidencias.</div>
+      )}
+      {rows.map((r) => (
+        <UserResultRow key={r.key} hit={r.hit} badge={r.badge} onPick={() => onPreviewUser(r.hit.pubkey)} />
+      ))}
+    </section>
+  );
+}
+
+function UserResultRow({ hit, badge, onPick }: { hit: UserHit; badge?: string; onPick: () => void }) {
+  const name = hit.displayName ?? formatPubkey(hit.pubkey);
+  return (
+    <button
+      type="button"
+      onClick={onPick}
+      className="flex w-full items-center gap-2.5 px-3 py-2 text-left hover:bg-lc-card border-b border-lc-border/40 last:border-b-0"
+      data-testid="search-user-row"
+      data-pubkey={hit.pubkey}
+    >
+      {hit.picture ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={hit.picture} alt="" className="w-7 h-7 rounded-full object-cover shrink-0" />
+      ) : (
+        <div className="w-7 h-7 rounded-full bg-lc-olive flex items-center justify-center text-lc-green text-xs font-semibold shrink-0">
+          {(name[0] || '?').toUpperCase()}
+        </div>
+      )}
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1.5">
+          <span className="text-sm text-lc-white truncate">{name}</span>
+          {badge && (
+            <span className="text-[9px] uppercase tracking-wider px-1.5 py-0.5 rounded-full bg-lc-green/15 text-lc-green border border-lc-green/30 shrink-0">
+              {badge}
+            </span>
+          )}
+        </div>
+        <div className="text-[11px] text-lc-muted truncate">
+          {hit.nip05 ?? formatPubkey(hit.pubkey)}
+        </div>
+      </div>
+    </button>
+  );
+}
+
+function ChannelsSection({ query, onClose }: { query: string; onClose: () => void }) {
+  const groups = useGroups();
+  const matches = useMemo(() => searchGroups(groups, query), [groups, query]);
+  if (matches.length === 0) return null;
+
+  const pick = (g: JsGroup) => {
+    void nostrActions.setActiveGroup(g.id);
+    onClose();
+  };
+
+  return (
+    <section data-testid="search-channels-section">
+      <div className="flex items-center px-3 py-2 text-[11px] font-bold uppercase tracking-wider text-lc-muted border-b border-lc-border">
+        <span>Canales</span>
+      </div>
+      {matches.slice(0, 10).map((g) => (
+        <button
+          key={g.id}
+          type="button"
+          onClick={() => pick(g)}
+          className="flex w-full items-center gap-2.5 px-3 py-2 text-left hover:bg-lc-card border-b border-lc-border/40 last:border-b-0"
+          data-testid="search-channel-row"
+          data-group-id={g.id}
+        >
+          {g.picture ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={g.picture} alt="" className="w-7 h-7 rounded-md object-cover shrink-0" />
+          ) : (
+            <div className="w-7 h-7 rounded-md bg-lc-olive flex items-center justify-center text-lc-green text-xs font-semibold shrink-0">
+              #
+            </div>
+          )}
+          <div className="min-w-0 flex-1">
+            <div className="text-sm text-lc-white truncate">#{g.name ?? g.id.slice(0, 8)}</div>
+            {g.about && <div className="text-[11px] text-lc-muted truncate">{g.about}</div>}
+          </div>
+        </button>
+      ))}
+    </section>
   );
 }
 
