@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, type MutableRefObject } from 'react';
 import { useChatStore } from '@/store/chat';
 import { useNotificationStore } from '@/store/notification';
+import { fetchWithRetry } from '@/lib/fetch-retry';
 import type { InitialUrl } from './useSlugResolution';
 
 type Args = {
@@ -41,9 +42,25 @@ export function useServerAndChannelLoader({
   const [serversLoaded, setServersLoaded] = useState(false);
   const [hasDefaultServer, setHasDefaultServer] = useState(false);
   const initialUrlAppliedRef = useRef({ server: false, channel: false });
+  // Bumped on visibilitychange/online to retrigger loaders when the tab
+  // wakes up or the network reconnects — without this, a failed initial
+  // fetch leaves the UI empty until manual refresh.
+  const [revalidateTick, setRevalidateTick] = useState(0);
 
   useEffect(() => {
-    fetch('/api/servers/default')
+    if (typeof window === 'undefined') return;
+    const bump = () => setRevalidateTick((n) => n + 1);
+    const onVis = () => { if (document.visibilityState === 'visible') bump(); };
+    window.addEventListener('online', bump);
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      window.removeEventListener('online', bump);
+      document.removeEventListener('visibilitychange', onVis);
+    };
+  }, []);
+
+  useEffect(() => {
+    fetchWithRetry('/api/servers/default')
       .then(res => res.ok ? res.json() : null)
       .then(data => {
         if (data?.defaultServer) setHasDefaultServer(true);
@@ -60,11 +77,14 @@ export function useServerAndChannelLoader({
     // the wrong server.
     if (!slugResolutionDone) return;
 
+    let cancelled = false;
     const fetchServers = async () => {
       try {
-        const res = await fetch('/api/servers');
-        if (!res.ok) return;
+        const res = await fetchWithRetry('/api/servers');
+        if (cancelled) return;
+        if (!res.ok) { setServersLoaded(true); return; }
         const data = await res.json();
+        if (cancelled) return;
         setServers(data.servers);
         setServersLoaded(true);
         if (data.servers.length > 0 && !activeServerId) {
@@ -87,18 +107,29 @@ export function useServerAndChannelLoader({
       }
     };
 
+    // Skip refetch on revalidate tick if servers already loaded successfully
+    // and non-empty — avoids clobbering user navigation on every tab focus.
+    const haveServers = serversLoaded && useChatStore.getState().servers.length > 0;
+    if (revalidateTick > 0 && haveServers) return;
+
     fetchServers();
-  }, [sessionChecked, slugResolutionDone, setServers, setActiveServer]);
+    return () => { cancelled = true; };
+  }, [sessionChecked, slugResolutionDone, setServers, setActiveServer, revalidateTick, serversLoaded]);
 
   // Fetch channels for the active server
   useEffect(() => {
     if (!sessionChecked || !activeServerId) return;
 
+    let cancelled = false;
     const fetchChannels = async () => {
       try {
-        const res = await fetch(`/api/channels?serverId=${activeServerId}`);
-        if (!res.ok) return;
+        const res = await fetchWithRetry(`/api/channels?serverId=${activeServerId}`);
+        if (cancelled) return;
+        if (!res.ok) { useChatStore.getState().setLoadingChannels(false); return; }
         const data = await res.json();
+        if (cancelled) return;
+        // Stale-response guard: bail if the user switched servers mid-fetch.
+        if (useChatStore.getState().activeServerId !== activeServerId) return;
 
         setChannels(data.pinnedChannels, data.categories);
 
@@ -141,6 +172,13 @@ export function useServerAndChannelLoader({
             || data.categories[0]?.channels[0];
           if (firstChannel) chosenChannel = firstChannel.id;
         }
+        // On a revalidation refetch (tab focus / reconnect), don't override
+        // the user's current channel selection — they've already navigated.
+        const currentActiveChannel = useChatStore.getState().activeChannelId;
+        const isRevalidation = currentActiveChannel
+          && allChans.some((ch: any) => ch.id === currentActiveChannel);
+        if (isRevalidation) chosenChannel = null;
+
         if (chosenChannel) {
           // On initial mount, queue a highlight so MessageArea scrolls to the
           // last-viewed message once messages load for this channel. Prefer
@@ -167,11 +205,13 @@ export function useServerAndChannelLoader({
         }
       } catch (err) {
         console.error('Failed to fetch channels:', err);
+        if (!cancelled) useChatStore.getState().setLoadingChannels(false);
       }
     };
 
     fetchChannels();
-  }, [sessionChecked, activeServerId, setChannels, setActiveChannel]);
+    return () => { cancelled = true; };
+  }, [sessionChecked, activeServerId, setChannels, setActiveChannel, revalidateTick]);
 
   // popstate: when a rendered #channel-link pill is clicked (or browser
   // back/forward fires), re-read ?c/?m/?p and navigate in-app. The slug is

@@ -1,8 +1,9 @@
 'use client';
 
-import { useEffect, type MutableRefObject } from 'react';
+import { useEffect, useState, type MutableRefObject } from 'react';
 import { useChatStore } from '@/store/chat';
 import { useNotificationStore } from '@/store/notification';
+import { fetchWithRetry } from '@/lib/fetch-retry';
 
 type Args = {
   activeChannelId: string | null;
@@ -43,10 +44,30 @@ export function useMessageLoader({
     })();
   }, [activePostId]);
 
+  // Revalidation tick — bumped on tab focus / network reconnect so a failed
+  // initial load doesn't leave the message pane empty until manual refresh.
+  const [revalidateTick, setRevalidateTick] = useState(0);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const bump = () => setRevalidateTick((n) => n + 1);
+    const onVis = () => { if (document.visibilityState === 'visible') bump(); };
+    window.addEventListener('online', bump);
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      window.removeEventListener('online', bump);
+      document.removeEventListener('visibilitychange', onVis);
+    };
+  }, []);
+
   // Fetch messages when channel changes
   useEffect(() => {
     if (!activeChannelId) return;
 
+    // On revalidation, only refetch if the message list is currently empty
+    // (i.e. the initial load failed). Otherwise leave the user's view alone.
+    if (revalidateTick > 0 && useChatStore.getState().messages.length > 0) return;
+
+    let cancelled = false;
     const fetchMessages = async () => {
       try {
         const pending = pendingHighlightRef.current;
@@ -54,9 +75,14 @@ export function useMessageLoader({
           !!pending && pending.channelId === activeChannelId;
 
         const postParam = activePostId ? `?postId=${encodeURIComponent(activePostId)}` : '';
-        const res = await fetch(`/api/channels/${activeChannelId}/messages${postParam}`);
-        if (!res.ok) return;
+        const res = await fetchWithRetry(`/api/channels/${activeChannelId}/messages${postParam}`);
+        if (cancelled) return;
+        if (!res.ok) { setLoadingMessages(false); return; }
         const data = await res.json();
+        if (cancelled) return;
+        // Stale-response guard: bail if the user navigated away mid-fetch.
+        const state = useChatStore.getState();
+        if (state.activeChannelId !== activeChannelId || state.activePostId !== activePostId) return;
 
         // Refresh-restore: if a highlight was queued for this channel (from
         // URL ?m= or per-channel localStorage), and the target message is in
@@ -115,5 +141,6 @@ export function useMessageLoader({
     };
 
     fetchMessages();
-  }, [activeChannelId, activePostId, setMessages, setLoadingMessages, setMessageCursor]);
+    return () => { cancelled = true; };
+  }, [activeChannelId, activePostId, setMessages, setLoadingMessages, setMessageCursor, revalidateTick]);
 }

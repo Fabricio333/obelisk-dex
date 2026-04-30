@@ -5,6 +5,16 @@ import { useChatStore } from '@/store/chat';
 
 const emptyProfileCache = new Map<string, { name?: string; picture?: string }>();
 
+// Helper: mark pubkeys as "active right now" so MemberList renders them online.
+// MemberList derives presence from `lastActivityAt` (relay-event timestamps),
+// not the legacy socket `onlinePubkeys` set.
+function setOnline(pubkeys: string[]) {
+  const now = Date.now();
+  for (const pk of pubkeys) {
+    useChatStore.getState().recordActivity(pk, now);
+  }
+}
+
 describe('MemberList presence indicator', () => {
   beforeEach(() => {
     useChatStore.setState(useChatStore.getInitialState());
@@ -15,7 +25,7 @@ describe('MemberList presence indicator', () => {
   });
 
   it('renders online members with a green dot and offline members with a muted dot', () => {
-    useChatStore.getState().setOnlinePubkeys(['pk-online']);
+    setOnline(['pk-online']);
 
     render(<MemberList profileCache={emptyProfileCache} />);
 
@@ -33,21 +43,22 @@ describe('MemberList presence indicator', () => {
     expect(screen.getAllByTitle('Offline')).toHaveLength(2);
   });
 
-  it('updates live when setPresence toggles a pubkey', () => {
+  it('updates live when an activity event arrives for a pubkey', () => {
     const { rerender } = render(<MemberList profileCache={emptyProfileCache} />);
     expect(screen.queryAllByTitle('Online')).toHaveLength(0);
 
-    useChatStore.getState().setPresence('pk-online', true);
+    useChatStore.getState().recordActivity('pk-online', Date.now());
     rerender(<MemberList profileCache={emptyProfileCache} />);
     expect(screen.getAllByTitle('Online')).toHaveLength(1);
 
-    useChatStore.getState().setPresence('pk-online', false);
+    // Activity older than the 15-minute window → fades to offline.
+    useChatStore.setState({ lastActivityAt: { 'pk-online': Date.now() - 16 * 60 * 1000 } });
     rerender(<MemberList profileCache={emptyProfileCache} />);
     expect(screen.queryAllByTitle('Online')).toHaveLength(0);
   });
 
   it('shows count as online/total', () => {
-    useChatStore.getState().setOnlinePubkeys(['pk-online']);
+    setOnline(['pk-online']);
     render(<MemberList profileCache={emptyProfileCache} />);
     expect(screen.getByText(/1\/2 online/i)).toBeInTheDocument();
   });
@@ -64,7 +75,7 @@ describe('MemberList role grouping', () => {
       { pubkey: 'pk-admin', displayName: 'Admin', role: 'admin' },
       { pubkey: 'pk-member', displayName: 'Member', role: 'member' },
     ]);
-    useChatStore.getState().setOnlinePubkeys(['pk-owner', 'pk-admin', 'pk-member']);
+    setOnline(['pk-owner', 'pk-admin', 'pk-member']);
 
     render(<MemberList profileCache={emptyProfileCache} />);
 
@@ -83,7 +94,7 @@ describe('MemberList role grouping', () => {
       },
       { pubkey: 'pk-normal', displayName: 'Normal', role: 'member' },
     ]);
-    useChatStore.getState().setOnlinePubkeys(['pk-vip', 'pk-normal']);
+    setOnline(['pk-vip', 'pk-normal']);
 
     render(<MemberList profileCache={emptyProfileCache} />);
 
@@ -96,7 +107,7 @@ describe('MemberList role grouping', () => {
       { pubkey: 'pk-online', displayName: 'Alice', role: 'member' },
       { pubkey: 'pk-offline', displayName: 'Bob', role: 'member' },
     ]);
-    useChatStore.getState().setOnlinePubkeys(['pk-online']);
+    setOnline(['pk-online']);
 
     render(<MemberList profileCache={emptyProfileCache} />);
 
@@ -121,7 +132,7 @@ describe('MemberList role grouping', () => {
         customRoles: [{ id: 'r1', name: 'Stars', color: '#ffd700', icon: '⭐', priority: 500 }],
       },
     ]);
-    useChatStore.getState().setOnlinePubkeys(['pk-star']);
+    setOnline(['pk-star']);
 
     render(<MemberList profileCache={emptyProfileCache} />);
 
@@ -137,7 +148,7 @@ describe('MemberList role grouping', () => {
         customRoles: [{ id: 'r2', name: 'Custom', color: '#00ff00', icon: '/uploads/icon.png', priority: 500 }],
       },
     ]);
-    useChatStore.getState().setOnlinePubkeys(['pk-img']);
+    setOnline(['pk-img']);
 
     render(<MemberList profileCache={emptyProfileCache} />);
 
@@ -151,7 +162,7 @@ describe('MemberList role grouping', () => {
       { pubkey: 'bot:b1', displayName: 'BTC/USD', isBot: true, statusText: 'BTC $63,412' },
       { pubkey: 'pk-real', displayName: 'Alice', role: 'member' },
     ]);
-    useChatStore.getState().setOnlinePubkeys(['pk-real']);
+    setOnline(['pk-real']);
 
     render(<MemberList profileCache={emptyProfileCache} />);
 
@@ -192,7 +203,7 @@ describe('MemberList role grouping', () => {
         customRoles: [{ id: 'r1', name: 'Gold', color: '#ffd700', priority: 500 }],
       },
     ]);
-    useChatStore.getState().setOnlinePubkeys(['pk-gold']);
+    setOnline(['pk-gold']);
 
     render(<MemberList profileCache={emptyProfileCache} />);
 

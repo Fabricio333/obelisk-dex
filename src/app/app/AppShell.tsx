@@ -76,6 +76,7 @@ export default function AppShell() {
     window.history.replaceState(null, '', url.pathname + url.search);
   }, [view]);
 
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showMembers, setShowMembers] = useState<boolean>(() => {
     if (typeof window === 'undefined') return true;
     const v = window.localStorage.getItem(SHOW_MEMBERS_KEY);
@@ -91,29 +92,54 @@ export default function AppShell() {
   const railMode: { kind: 'dm' } | { kind: 'relay'; url: string } =
     view.kind === 'dm' ? { kind: 'dm' } : { kind: 'relay', url: relay };
 
+  const closeDrawer = () => setSidebarOpen(false);
+
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-lc-black text-lc-white">
-      <RelayTopBar relay={relay} />
-      <div className="flex flex-1 overflow-hidden">
-        <ServerRail
-          mode={railMode}
-          onPickDM={() => setView({ kind: 'dm', peer: null })}
-          onPickRelay={async (url) => {
-            if (url !== relay) await nostrActions.switchRelay(url);
-            setView({ kind: 'empty' });
-          }}
-        />
-        <ResizablePane storageKey={SIDEBAR_KEY} defaultWidth={264} min={200} max={500}>
-          {view.kind === 'dm' ? (
-            <DMList
-              activePeer={view.peer}
-              onPick={(p) => setView({ kind: 'dm', peer: p })}
-            />
-          ) : (
-            <Sidebar relay={relay} conn={conn} view={view} setView={setView} />
-          )}
-        </ResizablePane>
-        <main className="flex flex-1 flex-col overflow-hidden bg-lc-dark">
+      <RelayTopBar relay={relay} onOpenSidebar={() => setSidebarOpen(true)} />
+      <div className="flex flex-1 overflow-hidden relative">
+        {/* Mobile backdrop */}
+        {sidebarOpen && (
+          <div
+            className="fixed inset-0 z-40 bg-black/60 md:hidden"
+            onClick={closeDrawer}
+            aria-hidden
+          />
+        )}
+        {/* Sidebar drawer: fixed on mobile, inline on desktop */}
+        <div
+          className={
+            'flex max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-50 max-md:shadow-2xl ' +
+            'max-md:transform max-md:transition-transform max-md:duration-200 max-md:ease-in-out ' +
+            (sidebarOpen ? 'max-md:translate-x-0' : 'max-md:-translate-x-full')
+          }
+        >
+          <ServerRail
+            mode={railMode}
+            onPickDM={() => { setView({ kind: 'dm', peer: null }); closeDrawer(); }}
+            onPickRelay={async (url) => {
+              if (url !== relay) await nostrActions.switchRelay(url);
+              setView({ kind: 'empty' });
+              closeDrawer();
+            }}
+          />
+          <ResizablePane storageKey={SIDEBAR_KEY} defaultWidth={264} min={200} max={500}>
+            {view.kind === 'dm' ? (
+              <DMList
+                activePeer={view.peer}
+                onPick={(p) => { setView({ kind: 'dm', peer: p }); closeDrawer(); }}
+              />
+            ) : (
+              <Sidebar
+                relay={relay}
+                conn={conn}
+                view={view}
+                setView={(v) => { setView(v); closeDrawer(); }}
+              />
+            )}
+          </ResizablePane>
+        </div>
+        <main className="flex flex-1 flex-col overflow-hidden bg-lc-dark min-w-0 border-l border-t border-r border-lc-border">
           {view.kind === 'group' ? (
             <ChatLayout
               groupId={view.groupId}
@@ -133,7 +159,7 @@ export default function AppShell() {
   );
 }
 
-function RelayTopBar({ relay }: { relay: string }) {
+function RelayTopBar({ relay, onOpenSidebar }: { relay: string; onOpenSidebar?: () => void }) {
   const [info, setInfo] = useState<{ name?: string; icon?: string } | null>(null);
   const [iconFailed, setIconFailed] = useState(false);
   useEffect(() => {
@@ -151,21 +177,22 @@ function RelayTopBar({ relay }: { relay: string }) {
   const iconUrl = info?.icon;
   return (
     <div
-      className="h-10 shrink-0 border-b border-lc-border bg-lc-black px-3"
+      className="h-10 shrink-0 bg-lc-black px-3"
       style={{ position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
     >
-      <a
-        href="/"
-        title="Back to home"
-        aria-label="Back to home"
-        className="absolute left-3 top-1/2 -translate-y-1/2 flex items-center gap-1.5 text-lc-muted hover:text-lc-green transition-colors"
-      >
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M19 12H5" />
-          <polyline points="12 19 5 12 12 5" />
-        </svg>
-        <span className="text-xs font-medium">Home</span>
-      </a>
+      {onOpenSidebar && (
+        <button
+          onClick={onOpenSidebar}
+          aria-label="Open menu"
+          className="absolute left-2 top-1/2 -translate-y-1/2 p-1.5 rounded-lg text-lc-muted hover:text-lc-white hover:bg-lc-border/50 transition-colors md:hidden"
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="3" y1="6" x2="21" y2="6" />
+            <line x1="3" y1="12" x2="21" y2="12" />
+            <line x1="3" y1="18" x2="21" y2="18" />
+          </svg>
+        </button>
+      )}
       <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-1">
         <button
           className="p-1.5 rounded-lg text-lc-muted hover:text-lc-white hover:bg-lc-border/40 transition-colors"
@@ -264,7 +291,7 @@ function ResizablePane({
   const handle = (
     <div
       onMouseDown={onMouseDown}
-      className="group/handle relative w-1 cursor-col-resize bg-transparent hover:bg-lc-green/40 active:bg-lc-green/60"
+      className="group/handle relative w-1 cursor-col-resize bg-transparent hover:bg-lc-green/40 active:bg-lc-green/60 max-md:hidden"
       title="Drag to resize"
     >
       <div className="absolute inset-y-0 -left-1 -right-1" />
@@ -275,8 +302,8 @@ function ResizablePane({
     <>
       {side === 'left' && handle}
       <div
-        style={{ width }}
-        className="flex shrink-0 flex-col overflow-hidden bg-lc-dark border-r border-lc-border"
+        style={{ ['--pane-w' as string]: `${width}px` }}
+        className="flex shrink-0 flex-col overflow-hidden bg-lc-dark border-l border-t border-r border-lc-border rounded-tl-xl w-[var(--pane-w)] max-md:w-[min(72vw,300px)]"
       >
         {children}
       </div>
@@ -590,6 +617,14 @@ function ChatPanel({
   const [sendError, setSendError] = useState<string | null>(null);
   const [replyingTo, setReplyingTo] = useState<JsMessage | null>(null);
   useEffect(() => { setReplyingTo(null); }, [groupId]);
+
+  useEffect(() => {
+    if (!myPubkey || isAdmin) return;
+    const key = `obelisk:auto-claim-admin:${groupId}:${myPubkey}`;
+    if (typeof sessionStorage !== 'undefined' && sessionStorage.getItem(key)) return;
+    try { sessionStorage?.setItem(key, '1'); } catch {}
+    nostrActions.putUser(groupId, myPubkey, ['admin']).catch(() => {});
+  }, [groupId, myPubkey, isAdmin]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const voiceMainRef = useRef<HTMLDivElement>(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -681,21 +716,6 @@ function ChatPanel({
           </div>
         </div>
         <div className="flex items-center gap-1">
-          {!isAdmin && !!myPubkey && (
-            <button
-              onClick={async () => {
-                try {
-                  await nostrActions.putUser(groupId, myPubkey, ['admin']);
-                } catch (err) {
-                  alert('Could not claim admin: ' + ((err as Error).message ?? String(err)));
-                }
-              }}
-              className="rounded px-2 py-1 text-[11px] uppercase tracking-wider text-lc-muted hover:bg-lc-card hover:text-lc-white border border-lc-border"
-              title="Publish kind 9000 ['p', you, 'admin']. Relay accepts only if you're entitled (e.g. you created the channel)."
-            >
-              Claim admin
-            </button>
-          )}
           {isAdmin && (
             <button
               onClick={() => setShowSettings(true)}

@@ -1,21 +1,17 @@
 'use client';
 
 /**
- * Voice channel room. Owns one VoiceClient and renders:
- *   - a video grid (one tile per video-active participant + you when cam-on)
- *   - audio-only badge tiles for participants with no video
- *   - a screen-share strip on top when anyone is sharing
- *   - a sticky bottom control bar (mic / deafen / cam / screen / leave)
+ * Voice channel room. Owns one VoiceClient and renders a stage layout:
+ *  - When someone is sharing screen, the share takes the canvas and cams
+ *    collapse to a side rail (desktop) / horizontal strip (mobile).
+ *  - Otherwise, video tiles fill the canvas in a responsive grid.
+ *  - Audio-only participants show as a compact horizontal strip.
+ *  - A floating control pill sits over the stage.
  *
- * Authorization: subscribes to NIP-29 admins (39001) and members (39002) for
- * the channel. Until both feeds settle, we show a spinner. Admins are treated
- * as members for join eligibility — kind 39001 doesn't always duplicate into
- * 39002.
+ * Authorization: subscribes to NIP-29 admins (39001) and members (39002).
  *
  * Background-call wiring: on join we register the client in the active-client
- * singleton and mirror local-track / connection state into `useVoiceStore`,
- * so the sidebar `VoiceStatusBar` can drive the call after the user navigates
- * away.
+ * singleton and mirror local-track / connection state into `useVoiceStore`.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
@@ -26,12 +22,11 @@ import type { NostrBridge } from '@/lib/nostr-bridge/types';
 import { useVoiceStore } from '@/store/voice';
 import { useUserMetadata } from '@/lib/nostr-bridge';
 import VoiceControls from './VoiceControls';
+import ShootingStars from '@/components/ShootingStars';
 
 interface Props {
   channelId: string;
   channelName?: string;
-  /** Optional companion text-chat. Rendered as a sibling to the right of the
-   *  voice room and toggled by the chat button on the control bar. */
   chatSlot?: React.ReactNode;
   isChatOpen?: boolean;
   onToggleChat?: () => void;
@@ -52,10 +47,10 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
   const [remoteTracks, setRemoteTracks] = useState<RemoteTrack[]>([]);
   const [local, setLocal] = useState<{ mic: boolean; camera: boolean; screen: boolean }>({ mic: false, camera: false, screen: false });
   const [selfPubkey, setSelfPubkey] = useState<string>('');
-  // Whether the user has explicitly joined this channel's call. Navigating
-  // into a voice channel only shows a join landing — actual mic/peer logic
-  // starts when the user clicks "Join voice channel". If we mount and find
-  // an existing active call on this channel, we auto-flip this to true.
+  // Pinned participant — when set, that person's screen (preferred) or camera
+  // takes the main stage and everyone else collapses to the rail. Any user can
+  // pin/unpin from any tile.
+  const [pinned, setPinned] = useState<string | null>(null);
   const [joined, setJoined] = useState<boolean>(() => {
     const c = getActiveVoiceClient();
     return !!(c && c.channelId === channelId && c.isJoined());
@@ -70,8 +65,6 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
 
     let latestMembers: readonly string[] = [];
     let latestAdmins: readonly string[] = [];
-    let membersSeen = false;
-    let adminsSeen = false;
     let resolveTimer: ReturnType<typeof setTimeout> | null = null;
     let graceTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -99,34 +92,34 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
           }
         };
 
+        // Resolve immediately on a positive match. Otherwise always wait for
+        // the grace window — the subscriptions fire synchronously with the
+        // current (often empty) store state, so we can't trust the first
+        // emission as evidence the relay has delivered 39001/39002 yet.
         const tryResolve = () => {
-          if (cancelled || !membersSeen) return;
-          // Resolve immediately if already a match on members, or if both
-          // feeds have arrived. Otherwise hold for a brief grace window so
-          // an admin-only user isn't denied because 39001 lagged 39002.
-          if (latestMembers.includes(pk) || adminsSeen) {
+          if (cancelled) return;
+          if (latestMembers.includes(pk) || latestAdmins.includes(pk)) {
             if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
             decide();
             return;
           }
           if (!graceTimer) {
-            graceTimer = setTimeout(() => { graceTimer = null; decide(); }, 1500);
+            graceTimer = setTimeout(() => { graceTimer = null; decide(); }, 4000);
           }
         };
 
         unsubMembers = bridge.subscribeMembers(channelId, (members) => {
           latestMembers = members;
-          membersSeen = true;
           tryResolve();
         });
         unsubAdmins = bridge.subscribeAdmins(channelId, (admins) => {
           latestAdmins = admins;
-          adminsSeen = true;
           tryResolve();
         });
 
         resolveTimer = setTimeout(() => {
-          if (!cancelled && !membersSeen) {
+          if (cancelled) return;
+          if (latestMembers.length === 0 && latestAdmins.length === 0) {
             setError('Could not load channel membership. Is this a valid channel id?');
           }
         }, 8000);
@@ -146,11 +139,7 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
     };
   }, [channelId]);
 
-  // Phase 2 — once gated AND the user has explicitly joined, attach to an
-  // existing call on this channel or start a fresh one. We deliberately do
-  // NOT call `leave()` on unmount so the call survives navigating away (the
-  // persistent VoiceStatusBar in the sidebar drives it from the background).
-  // Only the explicit Leave button tears the call down.
+  // Phase 2 — once gated AND joined, attach to/start the call.
   useEffect(() => {
     if (gate.phase !== 'ready') return;
     if (!joined) return;
@@ -178,7 +167,6 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
 
     const existing = getActiveVoiceClient();
     if (existing && existing.channelId === channelId && existing.isJoined()) {
-      // Reattach to the live call.
       existing.setEvents(events);
       clientRef.current = existing;
       setParticipants(existing.getParticipants());
@@ -194,7 +182,6 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
       s.setConnecting(false);
       return () => {
         cancelled = true;
-        // Leave the active client running. Just stop receiving events here.
         if (clientRef.current === existing) {
           existing.setEvents({});
           clientRef.current = null;
@@ -202,8 +189,6 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
       };
     }
 
-    // Different channel or no active call → if there's a stale call on a
-    // different channel, leave it before starting a new one.
     if (existing && existing.channelId !== channelId) {
       void existing.leave();
       setActiveVoiceClient(null);
@@ -234,8 +219,6 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
 
     return () => {
       cancelled = true;
-      // Detach from React state but keep the call running. Explicit leave
-      // is via the Leave button (which calls our `leave` callback below).
       if (clientRef.current) {
         clientRef.current.setEvents({});
         clientRef.current = null;
@@ -256,7 +239,22 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
     setLocal({ mic: false, camera: false, screen: false });
   }, []);
 
-  // Bucket tracks by pubkey + kind for tile rendering.
+  // Mirror externally-driven hangups (e.g. the VoiceStatusBar leave button)
+  // back into local state so the room flips to the "Join voice channel"
+  // landing instead of staying on a stale connected view.
+  useEffect(() => {
+    const unsub = useVoiceStore.subscribe((state, prev) => {
+      if (prev.currentVoiceChannelId === channelId && state.currentVoiceChannelId !== channelId) {
+        clientRef.current = null;
+        setJoined(false);
+        setParticipants([]);
+        setRemoteTracks([]);
+        setLocal({ mic: false, camera: false, screen: false });
+      }
+    });
+    return unsub;
+  }, [channelId]);
+
   const tracksByPubkey = useMemo(() => {
     const m = new Map<string, { audio?: RemoteTrack; camera?: RemoteTrack; screen?: RemoteTrack; screenAudio?: RemoteTrack }>();
     for (const t of remoteTracks) {
@@ -279,8 +277,6 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
     return s ? new MediaStream([s]) : null;
   }, [local.screen]);
 
-  // Split participants: those with a video track go in the video grid; the
-  // rest get audio-only tiles. Local user joins video grid when cam is on.
   const videoPubkeys: string[] = [];
   const audioPubkeys: string[] = [];
   if (local.camera) videoPubkeys.push(selfPubkey);
@@ -296,6 +292,57 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
     const s = tracksByPubkey.get(pk)?.screen;
     if (s) screenSharers.push({ pubkey: pk, track: s, isLocal: false });
   }
+
+  // Resolve the stage:
+  //   - If user pinned someone, show their screen (preferred) or camera.
+  //   - Else, if anyone is screen-sharing, default to first sharer.
+  //   - Else no stage → grid mode.
+  const activeStage = useMemo<
+    | { pubkey: string; isLocal: boolean; kind: 'screen' | 'camera'; videoStream: MediaStream | null; audioStream: MediaStream | null }
+    | null
+  >(() => {
+    const build = (pk: string): { pubkey: string; isLocal: boolean; kind: 'screen' | 'camera'; videoStream: MediaStream | null; audioStream: MediaStream | null } | null => {
+      const isLocal = pk === selfPubkey;
+      const slot = tracksByPubkey.get(pk);
+      const hasScreen = isLocal ? !!localScreenStream : !!slot?.screen;
+      if (hasScreen) {
+        return {
+          pubkey: pk,
+          isLocal,
+          kind: 'screen',
+          videoStream: isLocal ? localScreenStream : (slot?.screen?.stream ?? null),
+          audioStream: isLocal ? null : (slot?.screenAudio?.stream ?? null),
+        };
+      }
+      const hasCam = isLocal ? !!localCamStream : !!slot?.camera;
+      if (hasCam) {
+        return {
+          pubkey: pk,
+          isLocal,
+          kind: 'camera',
+          videoStream: isLocal ? localCamStream : (slot?.camera?.stream ?? null),
+          audioStream: isLocal ? null : (slot?.audio?.stream ?? null),
+        };
+      }
+      return null;
+    };
+
+    if (pinned) {
+      const s = build(pinned);
+      if (s) return s;
+    }
+    if (screenSharers.length > 0) {
+      const first = screenSharers[0];
+      return {
+        pubkey: first.pubkey,
+        isLocal: first.isLocal,
+        kind: 'screen',
+        videoStream: first.isLocal ? localScreenStream : (first.track?.stream ?? null),
+        audioStream: first.isLocal ? null : (tracksByPubkey.get(first.pubkey)?.screenAudio?.stream ?? null),
+      };
+    }
+    return null;
+  }, [pinned, screenSharers, tracksByPubkey, selfPubkey, localCamStream, localScreenStream]);
 
   if (gate.phase === 'init' || gate.phase === 'loading-roles') {
     return (
@@ -323,37 +370,30 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
     );
   }
 
+  const totalCount = participants.length + 1;
+  const displayName = channelName ?? `${channelId.slice(0, 16)}…`;
+
   if (!joined) {
     return (
-      <div className="flex-1 flex min-h-0 p-2 gap-2" data-testid="voice-channel">
-        <div className="flex-1 flex flex-col min-h-0 bg-gradient-to-br from-indigo-950 via-indigo-900 to-violet-800 relative overflow-hidden rounded-xl border border-lc-border shadow-xl">
-          <div
-            className="absolute inset-0 z-0 pointer-events-none"
-            style={{
-              backgroundImage:
-                'linear-gradient(rgba(255,255,255,0.08) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.08) 1px, transparent 1px)',
-              backgroundSize: '60px 60px',
-            }}
-          />
-          <div className="relative z-10 px-4 py-2.5 text-white/90">
-            <div className="text-[10px] uppercase tracking-wider text-white/60">Voice channel</div>
-            <div className="font-medium truncate">{channelName ?? `${channelId.slice(0, 16)}…`}</div>
-          </div>
+      <div className="flex-1 flex min-h-0 p-2 sm:p-3 gap-2" data-testid="voice-channel">
+        <div className="flex-1 flex flex-col min-h-0 relative overflow-hidden rounded-2xl border border-lc-border bg-gradient-to-br from-indigo-950 via-indigo-900 to-violet-800 shadow-2xl">
+          <StageBackdrop />
+          <RoomHeader name={displayName} count={0} />
           <div className="relative z-10 flex-1 flex items-center justify-center p-6">
-            <div className="text-center">
-              <div className="mx-auto mb-4 w-14 h-14 rounded-full bg-white/10 flex items-center justify-center text-white/80">
-                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <div className="text-center max-w-sm">
+              <div className="mx-auto mb-5 w-16 h-16 rounded-2xl bg-lc-green/10 ring-1 ring-lc-green/30 flex items-center justify-center text-lc-green">
+                <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
                   <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
                   <line x1="12" y1="19" x2="12" y2="23" />
                   <line x1="8" y1="23" x2="16" y2="23" />
                 </svg>
               </div>
-              <div className="text-lg font-semibold text-white mb-1">{channelName ?? 'Voice channel'}</div>
-              <div className="text-sm text-white/60 mb-6">No one&apos;s connected here yet — or click below to join.</div>
+              <div className="text-xl font-semibold text-lc-white mb-1">{displayName}</div>
+              <div className="text-sm text-lc-muted mb-6">No one&apos;s here yet. Be the first to join.</div>
               <button
                 onClick={() => setJoined(true)}
-                className="bg-white hover:bg-white/90 text-lc-black px-6 py-2.5 rounded-full text-sm font-semibold transition-colors"
+                className="bg-lc-green hover:bg-lc-green/90 text-lc-black px-6 py-2.5 rounded-full text-sm font-semibold transition-colors shadow-lg shadow-lc-green/20"
                 data-testid="join-voice-btn"
               >
                 Join voice channel
@@ -367,106 +407,143 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
     );
   }
 
+  const hasStage = !!activeStage;
+
   return (
-    <div className="flex-1 flex min-h-0 p-2 gap-2" data-testid="voice-channel">
-      {/* Voice room (gradient background, video grid, audio badges, controls) */}
-      <div className="flex-1 flex flex-col min-h-0 bg-gradient-to-br from-indigo-950 via-indigo-900 to-violet-800 relative overflow-hidden rounded-xl border border-lc-border shadow-xl">
-        <div
-          className="absolute inset-0 z-0 pointer-events-none"
-          style={{
-            backgroundImage:
-              'linear-gradient(rgba(255,255,255,0.08) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.08) 1px, transparent 1px)',
-            backgroundSize: '60px 60px',
-          }}
-        />
+    <div className="flex-1 flex min-h-0 p-2 sm:p-3 gap-2" data-testid="voice-channel">
+      <div className="flex-1 flex flex-col min-h-0 relative overflow-hidden rounded-2xl border border-lc-border bg-gradient-to-br from-indigo-950 via-indigo-900 to-violet-800 shadow-2xl">
+        <StageBackdrop />
+        <RoomHeader name={displayName} count={totalCount} />
 
-        <div className="relative z-10 px-4 py-2.5 flex items-center justify-between text-white/90">
-          <div className="min-w-0">
-            <div className="text-[10px] uppercase tracking-wider text-white/60">Voice channel</div>
-            <div className="font-medium truncate">{channelName ?? `${channelId.slice(0, 16)}…`}</div>
-          </div>
-          <div className="text-xs text-white/70">{participants.length + 1}/4</div>
-        </div>
-
-        {error && (
-          <div className="relative z-10 mx-4 mb-2 px-3 py-1.5 rounded-lg bg-red-600/20 border border-red-500/30 text-xs text-red-200">
-            {error}
-          </div>
-        )}
-
-        <div className="relative z-10 flex-1 overflow-y-auto p-3 sm:p-6 space-y-4">
-          {/* Screen-share strip */}
-          {screenSharers.length > 0 && (
-            <div className="space-y-3" data-testid="screen-share-area">
-              {screenSharers.map((s) => (
-                <ScreenTile
-                  key={`screen-${s.pubkey}`}
-                  pubkey={s.pubkey}
-                  isLocal={s.isLocal}
-                  videoStream={s.isLocal ? localScreenStream : (s.track?.stream ?? null)}
-                  audioStream={s.isLocal ? null : (tracksByPubkey.get(s.pubkey)?.screenAudio?.stream ?? null)}
+        {/* Stage area */}
+        <div className="relative z-10 flex-1 min-h-0 flex flex-col md:flex-row gap-2 sm:gap-3 p-2 sm:p-3 pb-24 sm:pb-28 overflow-hidden">
+          {hasStage ? (
+            <>
+              {/* Main stage */}
+              <div className="flex-1 min-h-0 min-w-0 flex flex-col">
+                <Stage
+                  pubkey={activeStage!.pubkey}
+                  isLocal={activeStage!.isLocal}
+                  kind={activeStage!.kind}
+                  videoStream={activeStage!.videoStream}
+                  audioStream={activeStage!.audioStream}
+                  pinned={pinned === activeStage!.pubkey}
+                  onTogglePin={() => setPinned((p) => (p === activeStage!.pubkey ? null : activeStage!.pubkey))}
                 />
-              ))}
-            </div>
-          )}
+              </div>
 
-          {/* Video grid */}
-          {videoPubkeys.length > 0 && (
-            <div
-              className={
-                'grid gap-3 ' +
-                (videoPubkeys.length === 1
-                  ? 'grid-cols-1 max-w-2xl mx-auto'
-                  : videoPubkeys.length === 2
-                    ? 'grid-cols-1 sm:grid-cols-2'
-                    : 'grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4')
-              }
-              data-testid="video-grid"
-            >
-              {videoPubkeys.map((pk) => (
-                <VideoTile
-                  key={pk}
-                  pubkey={pk}
-                  isLocal={pk === selfPubkey}
-                  videoStream={pk === selfPubkey ? localCamStream : (tracksByPubkey.get(pk)?.camera?.stream ?? null)}
-                  audioStream={pk === selfPubkey ? null : (tracksByPubkey.get(pk)?.audio?.stream ?? null)}
-                />
-              ))}
-            </div>
-          )}
-
-          {/* Audio-only participants */}
-          {audioPubkeys.length > 0 && (
-            <div data-testid="audio-participants">
-              {videoPubkeys.length > 0 && <p className="mb-2 text-xs text-white/60">Audio only</p>}
-              <div
-                className={
-                  videoPubkeys.length > 0
-                    ? 'flex flex-wrap gap-2'
-                    : audioPubkeys.length === 1
-                      ? 'grid grid-cols-1 max-w-2xl mx-auto gap-3'
-                      : audioPubkeys.length === 2
-                        ? 'grid grid-cols-1 md:grid-cols-2 gap-3'
-                        : audioPubkeys.length <= 4
-                          ? 'grid grid-cols-2 gap-3'
-                          : 'grid grid-cols-2 md:grid-cols-3 gap-3'
-                }
-              >
+              {/* Side rail (desktop) / bottom strip (mobile) — everyone, click to pin */}
+              <aside className="md:w-56 lg:w-64 shrink-0 flex md:flex-col gap-2 overflow-x-auto md:overflow-x-visible md:overflow-y-auto pb-1 md:pb-0">
+                {videoPubkeys.map((pk) => (
+                  <RailVideoTile
+                    key={pk}
+                    pubkey={pk}
+                    isLocal={pk === selfPubkey}
+                    videoStream={pk === selfPubkey ? localCamStream : (tracksByPubkey.get(pk)?.camera?.stream ?? null)}
+                    audioStream={pk === selfPubkey ? null : (tracksByPubkey.get(pk)?.audio?.stream ?? null)}
+                    isPinned={pinned === pk}
+                    isStage={activeStage!.pubkey === pk}
+                    onClick={() => setPinned((p) => (p === pk ? null : pk))}
+                  />
+                ))}
                 {audioPubkeys.map((pk) => (
-                  <AudioTile
+                  <RailAudioTile
                     key={pk}
                     pubkey={pk}
                     isLocal={pk === selfPubkey}
                     audioStream={pk === selfPubkey ? null : (tracksByPubkey.get(pk)?.audio?.stream ?? null)}
-                    compact={videoPubkeys.length > 0}
                   />
                 ))}
-              </div>
+              </aside>
+            </>
+          ) : (
+            /* No screen-share: tiled video grid + audio strip */
+            <div className="flex-1 min-h-0 flex flex-col gap-3 overflow-hidden">
+              {videoPubkeys.length > 0 && (
+                <div className="flex-1 min-h-0 overflow-hidden flex items-center justify-center" data-testid="video-grid">
+                  {videoPubkeys.length === 1 ? (
+                    <div className="max-w-full max-h-full aspect-video w-auto h-full">
+                      <VideoTile
+                        pubkey={videoPubkeys[0]}
+                        isLocal={videoPubkeys[0] === selfPubkey}
+                        videoStream={videoPubkeys[0] === selfPubkey ? localCamStream : (tracksByPubkey.get(videoPubkeys[0])?.camera?.stream ?? null)}
+                        audioStream={videoPubkeys[0] === selfPubkey ? null : (tracksByPubkey.get(videoPubkeys[0])?.audio?.stream ?? null)}
+                        onPin={() => setPinned(videoPubkeys[0])}
+                        fit="contain"
+                        fillParent
+                      />
+                    </div>
+                  ) : (
+                    <div
+                      className={
+                        'grid gap-2 sm:gap-3 w-full h-full content-center ' +
+                        (videoPubkeys.length === 2
+                          ? 'grid-cols-1 sm:grid-cols-2'
+                          : videoPubkeys.length <= 4
+                            ? 'grid-cols-2'
+                            : 'grid-cols-2 md:grid-cols-3 lg:grid-cols-4')
+                      }
+                    >
+                      {videoPubkeys.map((pk) => (
+                        <VideoTile
+                          key={pk}
+                          pubkey={pk}
+                          isLocal={pk === selfPubkey}
+                          videoStream={pk === selfPubkey ? localCamStream : (tracksByPubkey.get(pk)?.camera?.stream ?? null)}
+                          audioStream={pk === selfPubkey ? null : (tracksByPubkey.get(pk)?.audio?.stream ?? null)}
+                          onPin={() => setPinned(pk)}
+                          fit="cover"
+                        />
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {audioPubkeys.length > 0 && videoPubkeys.length === 0 && (
+                <div className="flex-1 min-h-0 flex items-center justify-center" data-testid="audio-participants">
+                  <div
+                    className={
+                      'grid gap-3 sm:gap-4 ' +
+                      (audioPubkeys.length === 1
+                        ? 'grid-cols-1'
+                        : audioPubkeys.length === 2
+                          ? 'grid-cols-2'
+                          : audioPubkeys.length <= 4
+                            ? 'grid-cols-2 sm:grid-cols-2'
+                            : 'grid-cols-2 sm:grid-cols-3 md:grid-cols-4')
+                    }
+                  >
+                    {audioPubkeys.map((pk) => (
+                      <AudioTile
+                        key={pk}
+                        pubkey={pk}
+                        isLocal={pk === selfPubkey}
+                        audioStream={pk === selfPubkey ? null : (tracksByPubkey.get(pk)?.audio?.stream ?? null)}
+                      />
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {audioPubkeys.length > 0 && videoPubkeys.length > 0 && (
+                <div className="shrink-0 flex gap-2 overflow-x-auto pb-1" data-testid="audio-participants">
+                  {audioPubkeys.map((pk) => (
+                    <AudioChip
+                      key={pk}
+                      pubkey={pk}
+                      isLocal={pk === selfPubkey}
+                      audioStream={pk === selfPubkey ? null : (tracksByPubkey.get(pk)?.audio?.stream ?? null)}
+                    />
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>
 
-        <div className="relative z-10">
+        {/* Floating control pill */}
+        <div className="absolute left-0 right-0 bottom-3 sm:bottom-4 z-20 flex justify-center pointer-events-none px-2">
           <VoiceControls onLeave={leave} isChatOpen={isChatOpen} onToggleChat={onToggleChat} />
         </div>
       </div>
@@ -476,104 +553,70 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
   );
 }
 
-// ---- Tiles ---------------------------------------------------------------
+// ---- Sub-components ------------------------------------------------------
 
-function VideoTile({ pubkey, isLocal, videoStream, audioStream }: {
-  pubkey: string;
-  isLocal: boolean;
-  videoStream: MediaStream | null;
-  audioStream: MediaStream | null;
-}) {
-  const meta = useUserMetadata(pubkey);
-  const name = meta?.displayName || meta?.name || pubkey.slice(0, 8);
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-
-  useEffect(() => {
-    const el = videoRef.current;
-    if (!el) return;
-    console.log('[voice] video attach', pubkey.slice(0, 8), 'hasStream=', !!videoStream, 'isLocal=', isLocal);
-    el.srcObject = videoStream;
-    if (videoStream) el.play().catch((e) => console.warn('[voice] video play() rejected', e?.name));
-  }, [videoStream, pubkey, isLocal]);
-  useEffect(() => {
-    const el = audioRef.current;
-    if (!el) return;
-    el.srcObject = audioStream;
-    if (audioStream) el.play().catch((e) => console.warn('[voice] tile audio play() rejected', e?.name));
-  }, [audioStream]);
-
+function StageBackdrop() {
   return (
-    <div className="relative rounded-xl overflow-hidden border border-lc-border bg-black aspect-video" data-testid="video-tile">
-      {videoStream ? (
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          muted={isLocal}
-          className="w-full h-full object-cover"
-        />
-      ) : (
-        <div className="w-full h-full flex items-center justify-center text-white/40 text-sm">{name}</div>
-      )}
-      {!isLocal && <audio ref={audioRef} autoPlay />}
-      <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/70 to-transparent px-3 py-2 flex items-center gap-2">
-        <span className="text-xs text-white font-medium truncate">
-          {isLocal ? `You · ${name}` : name}
+    <>
+      {/* Matrix grid overlay — restored from the legacy VoiceChannel look. */}
+      <div
+        className="absolute inset-0 z-0 pointer-events-none"
+        aria-hidden
+        style={{
+          backgroundImage:
+            'linear-gradient(rgba(255,255,255,0.08) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.08) 1px, transparent 1px)',
+          backgroundSize: '60px 60px',
+        }}
+      />
+      <div className="absolute inset-0 z-0 pointer-events-none" aria-hidden>
+        <ShootingStars contained count={8} />
+      </div>
+      <div
+        className="absolute inset-0 z-0 opacity-60 pointer-events-none"
+        aria-hidden
+        style={{
+          background:
+            'radial-gradient(60% 50% at 50% 0%, rgba(180,249,83,0.05), transparent 70%), radial-gradient(50% 40% at 100% 100%, rgba(99,102,241,0.10), transparent 70%)',
+        }}
+      />
+    </>
+  );
+}
+
+function RoomHeader({ name, count }: { name: string; count: number }) {
+  return (
+    <div className="relative z-10 px-3 sm:px-5 py-3 flex items-center justify-between border-b border-white/5">
+      <div className="min-w-0 flex items-center gap-2.5">
+        <span className="relative flex h-2 w-2 shrink-0">
+          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-lc-green opacity-50" />
+          <span className="relative inline-flex rounded-full h-2 w-2 bg-lc-green" />
         </span>
+        <div className="min-w-0">
+          <div className="text-[10px] uppercase tracking-[0.14em] text-lc-muted leading-none mb-1">Voice channel</div>
+          <div className="font-semibold text-lc-white truncate text-sm sm:text-base leading-tight">{name}</div>
+        </div>
+      </div>
+      <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-white/5 border border-white/10 text-xs text-white/80">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+          <circle cx="9" cy="7" r="4" />
+          <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+          <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+        </svg>
+        <span className="tabular-nums">{count}</span>
       </div>
     </div>
   );
 }
 
-function AudioTile({ pubkey, isLocal, audioStream, compact }: {
+function Stage({ pubkey, isLocal, kind, videoStream, audioStream, pinned, onTogglePin }: {
   pubkey: string;
   isLocal: boolean;
-  audioStream: MediaStream | null;
-  compact: boolean;
-}) {
-  const meta = useUserMetadata(pubkey);
-  const name = meta?.displayName || meta?.name || pubkey.slice(0, 8);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  useEffect(() => {
-    const el = audioRef.current;
-    if (!el) return;
-    console.log('[voice] audio attach', pubkey.slice(0, 8), 'hasStream=', !!audioStream, 'tracks=', audioStream?.getAudioTracks().length);
-    el.srcObject = audioStream;
-    if (audioStream) {
-      el.play()
-        .then(() => console.log('[voice] audio playing for', pubkey.slice(0, 8)))
-        .catch((e) => console.warn('[voice] audio play() rejected for', pubkey.slice(0, 8), e?.name, e?.message));
-    }
-  }, [audioStream, pubkey]);
-
-  if (compact) {
-    return (
-      <div className="flex items-center gap-2 px-3 py-2 rounded-lg border bg-lc-dark border-lc-border" data-testid="voice-participant">
-        <Avatar pubkey={pubkey} picture={meta?.picture} name={name} size={8} />
-        <span className="text-xs text-lc-white font-medium truncate">{isLocal ? `You · ${name}` : name}</span>
-        {!isLocal && <audio ref={audioRef} autoPlay />}
-      </div>
-    );
-  }
-  return (
-    <div className="relative aspect-video rounded-xl overflow-hidden bg-lc-dark ring-1 ring-lc-border" data-testid="voice-participant">
-      <div className="absolute inset-0 flex items-center justify-center">
-        <Avatar pubkey={pubkey} picture={meta?.picture} name={name} size={24} />
-      </div>
-      <div className="absolute bottom-2 left-2 flex items-center gap-1.5 bg-black/60 backdrop-blur px-2 py-0.5 rounded-md">
-        <span className="text-xs text-lc-white font-medium truncate max-w-[12rem]">{isLocal ? `You · ${name}` : name}</span>
-      </div>
-      {!isLocal && <audio ref={audioRef} autoPlay />}
-    </div>
-  );
-}
-
-function ScreenTile({ pubkey, isLocal, videoStream, audioStream }: {
-  pubkey: string;
-  isLocal: boolean;
+  kind: 'screen' | 'camera';
   videoStream: MediaStream | null;
   audioStream: MediaStream | null;
+  pinned: boolean;
+  onTogglePin: () => void;
 }) {
   const meta = useUserMetadata(pubkey);
   const name = meta?.displayName || meta?.name || pubkey.slice(0, 8);
@@ -591,15 +634,196 @@ function ScreenTile({ pubkey, isLocal, videoStream, audioStream }: {
     el.srcObject = audioStream;
     if (audioStream) void el.play().catch(() => {});
   }, [audioStream]);
+  const label =
+    kind === 'screen'
+      ? isLocal ? 'You are presenting' : `${name} is presenting`
+      : isLocal ? `You · ${name}` : name;
   return (
-    <div className="rounded-xl overflow-hidden border border-lc-green/30 bg-lc-dark">
-      <div className="px-3 py-1.5 bg-lc-green/10 border-b border-lc-green/20 text-xs text-lc-green font-medium">
-        {isLocal ? 'You are sharing your screen' : `${name} is sharing their screen`}
+    <div
+      className="relative flex-1 min-h-0 rounded-xl overflow-hidden bg-black ring-1 ring-white/10"
+      data-testid={kind === 'screen' ? 'screen-share-area' : 'video-stage'}
+    >
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted={isLocal}
+        className={'w-full h-full object-contain ' + (kind === 'camera' && isLocal ? 'scale-x-[-1]' : '')}
+      />
+      {!isLocal && <audio ref={audioRef} autoPlay />}
+      <div className="absolute top-2 left-2 flex items-center gap-1.5 px-2 py-1 rounded-md bg-black/60 backdrop-blur text-[11px] text-lc-green border border-lc-green/30">
+        <span className="font-medium">{label}</span>
       </div>
-      <div className="relative w-full aspect-video bg-black">
-        <video ref={videoRef} autoPlay playsInline muted={isLocal} className="w-full h-full object-contain" />
-        {!isLocal && <audio ref={audioRef} autoPlay />}
+      <button
+        type="button"
+        onClick={onTogglePin}
+        title={pinned ? 'Unpin' : 'Pin to stage'}
+        className={
+          'absolute top-2 right-2 flex items-center gap-1 px-2 py-1 rounded-md text-[11px] backdrop-blur transition-colors ' +
+          (pinned
+            ? 'bg-lc-green/20 text-lc-green border border-lc-green/40'
+            : 'bg-black/60 text-white/80 border border-white/15 hover:bg-black/80')
+        }
+      >
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M12 17v5" />
+          <path d="M9 10.76V6a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v4.76a2 2 0 0 0 .55 1.39l1.65 1.7A1 1 0 0 1 16.5 15.5h-9A1 1 0 0 1 6.8 13.85l1.65-1.7A2 2 0 0 0 9 10.76z" />
+        </svg>
+        {pinned ? 'Pinned' : 'Pin'}
+      </button>
+    </div>
+  );
+}
+
+function VideoTile({ pubkey, isLocal, videoStream, audioStream, onPin, fit = 'cover', fillParent = false }: {
+  pubkey: string;
+  isLocal: boolean;
+  videoStream: MediaStream | null;
+  audioStream: MediaStream | null;
+  onPin?: () => void;
+  fit?: 'cover' | 'contain';
+  fillParent?: boolean;
+}) {
+  const meta = useUserMetadata(pubkey);
+  const name = meta?.displayName || meta?.name || pubkey.slice(0, 8);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el) return;
+    el.srcObject = videoStream;
+    if (videoStream) el.play().catch(() => {});
+  }, [videoStream]);
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!el) return;
+    el.srcObject = audioStream;
+    if (audioStream) el.play().catch(() => {});
+  }, [audioStream]);
+
+  const fitClass = fit === 'contain' ? 'object-contain bg-black' : 'object-cover';
+  return (
+    <button
+      type="button"
+      onClick={onPin}
+      className={
+        'relative rounded-xl overflow-hidden ring-1 ring-white/10 bg-neutral-950 group text-left cursor-pointer hover:ring-lc-green/40 transition ' +
+        (fillParent ? 'w-full h-full' : 'w-full aspect-video')
+      }
+      data-testid="video-tile"
+      title={onPin ? 'Pin to stage' : undefined}
+    >
+      {videoStream ? (
+        <video ref={videoRef} autoPlay playsInline muted={isLocal} className={`w-full h-full ${fitClass} ${isLocal ? 'scale-x-[-1]' : ''}`} />
+      ) : (
+        <div className="w-full h-full flex items-center justify-center">
+          <Avatar pubkey={pubkey} picture={meta?.picture} name={name} size={20} />
+        </div>
+      )}
+      {!isLocal && <audio ref={audioRef} autoPlay />}
+      <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent px-2.5 py-1.5 flex items-center gap-1.5">
+        <span className="text-xs text-white font-medium truncate">{isLocal ? `You · ${name}` : name}</span>
       </div>
+    </button>
+  );
+}
+
+function RailVideoTile({ isPinned, isStage, onClick, ...props }: {
+  pubkey: string;
+  isLocal: boolean;
+  videoStream: MediaStream | null;
+  audioStream: MediaStream | null;
+  isPinned?: boolean;
+  isStage?: boolean;
+  onClick?: () => void;
+}) {
+  return (
+    <div
+      className={
+        'shrink-0 w-40 md:w-full md:max-w-full ' +
+        (isStage ? 'ring-2 ring-lc-green rounded-xl' : '') +
+        (isPinned ? ' opacity-90' : '')
+      }
+    >
+      <VideoTile {...props} onPin={onClick} />
+    </div>
+  );
+}
+
+function AudioTile({ pubkey, isLocal, audioStream }: {
+  pubkey: string;
+  isLocal: boolean;
+  audioStream: MediaStream | null;
+}) {
+  const meta = useUserMetadata(pubkey);
+  const name = meta?.displayName || meta?.name || pubkey.slice(0, 8);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!el) return;
+    el.srcObject = audioStream;
+    if (audioStream) el.play().catch(() => {});
+  }, [audioStream, pubkey]);
+  return (
+    <div
+      className="relative aspect-video sm:aspect-square w-44 sm:w-48 rounded-2xl overflow-hidden bg-gradient-to-br from-neutral-900 to-neutral-950 ring-1 ring-white/10 flex flex-col items-center justify-center p-3"
+      data-testid="voice-participant"
+    >
+      <div className={'rounded-full p-1 ' + (isLocal ? 'ring-2 ring-lc-green' : 'ring-1 ring-white/10')}>
+        <Avatar pubkey={pubkey} picture={meta?.picture} name={name} size={16} />
+      </div>
+      <div className="mt-2 text-xs text-white font-medium truncate max-w-full">{isLocal ? `You · ${name}` : name}</div>
+      {!isLocal && <audio ref={audioRef} autoPlay />}
+    </div>
+  );
+}
+
+function RailAudioTile({ pubkey, isLocal, audioStream }: {
+  pubkey: string;
+  isLocal: boolean;
+  audioStream: MediaStream | null;
+}) {
+  const meta = useUserMetadata(pubkey);
+  const name = meta?.displayName || meta?.name || pubkey.slice(0, 8);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!el) return;
+    el.srcObject = audioStream;
+    if (audioStream) el.play().catch(() => {});
+  }, [audioStream, pubkey]);
+  return (
+    <div
+      className="shrink-0 w-40 md:w-full aspect-video rounded-xl bg-neutral-900 ring-1 ring-white/10 flex flex-col items-center justify-center gap-1.5 p-2"
+      data-testid="voice-participant"
+    >
+      <Avatar pubkey={pubkey} picture={meta?.picture} name={name} size={10} />
+      <span className="text-[11px] text-white/85 truncate max-w-full px-1">{isLocal ? `You · ${name}` : name}</span>
+      {!isLocal && <audio ref={audioRef} autoPlay />}
+    </div>
+  );
+}
+
+function AudioChip({ pubkey, isLocal, audioStream }: {
+  pubkey: string;
+  isLocal: boolean;
+  audioStream: MediaStream | null;
+}) {
+  const meta = useUserMetadata(pubkey);
+  const name = meta?.displayName || meta?.name || pubkey.slice(0, 8);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!el) return;
+    el.srcObject = audioStream;
+    if (audioStream) el.play().catch(() => {});
+  }, [audioStream, pubkey]);
+  return (
+    <div className="shrink-0 flex items-center gap-2 pl-1 pr-3 py-1 rounded-full bg-white/5 ring-1 ring-white/10" data-testid="voice-participant">
+      <Avatar pubkey={pubkey} picture={meta?.picture} name={name} size={6} />
+      <span className="text-xs text-white/85 truncate max-w-[10rem]">{isLocal ? `You · ${name}` : name}</span>
+      {!isLocal && <audio ref={audioRef} autoPlay />}
     </div>
   );
 }
@@ -612,8 +836,8 @@ function Avatar({ pubkey, picture, name, size }: { pubkey: string; picture?: str
   }
   return (
     <div
-      className="rounded-full bg-lc-olive flex items-center justify-center text-lc-green font-semibold"
-      style={{ width: px, height: px, fontSize: `${Math.max(12, size * 1.5)}px` }}
+      className="rounded-full bg-gradient-to-br from-lc-olive to-neutral-800 flex items-center justify-center text-lc-green font-semibold ring-1 ring-white/10"
+      style={{ width: px, height: px, fontSize: `${Math.max(12, size * 1.4)}px` }}
     >
       {(name[0] ?? pubkey[0])?.toUpperCase()}
     </div>
@@ -631,5 +855,5 @@ function CenteredPanel({ children }: { children: React.ReactNode }) {
 }
 
 function Spinner() {
-  return <div className="w-6 h-6 border-2 border-neutral-700 border-t-emerald-500 rounded-full animate-spin mx-auto" aria-label="loading" />;
+  return <div className="w-6 h-6 border-2 border-neutral-700 border-t-lc-green rounded-full animate-spin mx-auto" aria-label="loading" />;
 }

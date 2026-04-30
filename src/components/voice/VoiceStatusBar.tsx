@@ -12,7 +12,7 @@
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useGroups } from '@/lib/nostr-bridge';
 import { useVoiceStore } from '@/store/voice';
-import { getActiveVoiceClient } from '@/lib/voice/active-client';
+import { getActiveVoiceClient, setActiveVoiceClient } from '@/lib/voice/active-client';
 
 export default function VoiceStatusBar() {
   const router = useRouter();
@@ -66,9 +66,17 @@ export default function VoiceStatusBar() {
     }
   };
 
+  // Mirror the in-room "Leave" flow from VoiceRoom.leave() so the status-bar
+  // hangup button has the same effect: tear down the client, clear the active
+  // client ref, and reset the global voice store. Without the last two steps
+  // the bar would stick around in a half-disconnected state.
   const handleLeave = async () => {
     const c = getActiveVoiceClient();
-    if (c) await c.leave();
+    if (c) {
+      try { await c.leave(); } catch { /* swallow */ }
+    }
+    setActiveVoiceClient(null);
+    useVoiceStore.getState().leaveVoice();
   };
 
   const handleJump = () => {

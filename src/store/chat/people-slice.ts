@@ -12,6 +12,13 @@ export interface PeopleSlice {
   // Presence: pubkeys currently connected via Socket.io
   onlinePubkeys: Set<string>;
 
+  // Nostr-relay activity: last event timestamp (ms) seen per pubkey.
+  // Drives the member-list online indicator (online = activity within 15m).
+  lastActivityAt: Record<string, number>;
+  // Bumped on a timer so consumers re-evaluate the 15m window even when
+  // no new event has streamed in.
+  presenceTick: number;
+
   // Typing indicator
   typingUsers: Record<string, number>; // pubkey -> timeout id
 
@@ -38,6 +45,10 @@ export interface PeopleSlice {
   // Presence
   setOnlinePubkeys: (pubkeys: string[]) => void;
   setPresence: (pubkey: string, online: boolean) => void;
+
+  // Relay-activity presence
+  recordActivity: (pubkey: string, atMs: number) => void;
+  bumpPresenceTick: () => void;
 }
 
 export const PEOPLE_INITIAL_STATE = {
@@ -45,6 +56,8 @@ export const PEOPLE_INITIAL_STATE = {
   profilePopupPubkey: null as string | null,
   onlinePubkeys: new Set<string>(),
   typingUsers: {} as Record<string, number>,
+  lastActivityAt: {} as Record<string, number>,
+  presenceTick: 0,
 };
 
 export const createPeopleSlice: StateCreator<ChatState, [], [], PeopleSlice> = (set, get) => ({
@@ -90,4 +103,11 @@ export const createPeopleSlice: StateCreator<ChatState, [], [], PeopleSlice> = (
     else next.delete(pubkey);
     return { onlinePubkeys: next };
   }),
+
+  recordActivity: (pubkey, atMs) => set((state) => {
+    const prev = state.lastActivityAt[pubkey] ?? 0;
+    if (atMs <= prev) return state;
+    return { lastActivityAt: { ...state.lastActivityAt, [pubkey]: atMs } };
+  }),
+  bumpPresenceTick: () => set((state) => ({ presenceTick: state.presenceTick + 1 })),
 });

@@ -132,16 +132,49 @@ export default function InlineProfileEditor() {
         </p>
       </div>
 
-      {/* Banner preview + uploader */}
+      {/* Profile preview */}
       <section className="lc-card overflow-hidden">
         <div
-          className="h-32 w-full bg-gradient-to-br from-lc-olive to-lc-black relative"
+          className="h-32 w-full bg-gradient-to-br from-lc-olive to-lc-black"
           style={currentBanner ? { backgroundImage: `url(${currentBanner})`, backgroundSize: 'cover', backgroundPosition: 'center' } : undefined}
-        >
-          <button
-            onClick={() => bannerInputRef.current?.click()}
-            className="absolute top-3 right-3 lc-pill-secondary text-xs"
-          >
+        />
+        <div className="px-5 pb-5 -mt-12">
+          <div className="relative w-24 h-24 rounded-full border-4 border-lc-dark overflow-hidden bg-lc-olive">
+            {currentPicture ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={currentPicture} alt="" className="w-full h-full object-cover" />
+            ) : (
+              <div className="w-full h-full flex items-center justify-center text-lc-green text-3xl font-semibold">
+                {name ? name[0].toUpperCase() : '?'}
+              </div>
+            )}
+          </div>
+          <div className="mt-3">
+            <div className="text-lc-white font-semibold truncate">{name || '—'}</div>
+            {nip05 && <div className="text-xs text-lc-muted truncate">{nip05}</div>}
+            {about && <div className="text-sm text-lc-muted mt-2 whitespace-pre-wrap">{about}</div>}
+          </div>
+        </div>
+      </section>
+
+      {/* Image uploaders */}
+      <section className="lc-card p-5 grid gap-3 sm:grid-cols-2">
+        <div>
+          <div className="text-xs text-lc-muted font-medium uppercase tracking-wide mb-2">Foto de perfil</div>
+          <button onClick={() => fileInputRef.current?.click()} className="lc-pill-secondary text-xs">
+            {currentPicture ? 'Cambiar foto' : 'Subir foto'}
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={(e) => { const f = e.target.files?.[0]; if (f) pickFile('picture', f); }}
+          />
+        </div>
+        <div>
+          <div className="text-xs text-lc-muted font-medium uppercase tracking-wide mb-2">Banner</div>
+          <button onClick={() => bannerInputRef.current?.click()} className="lc-pill-secondary text-xs">
             {currentBanner ? 'Cambiar banner' : 'Subir banner'}
           </button>
           <input
@@ -151,31 +184,6 @@ export default function InlineProfileEditor() {
             className="hidden"
             onChange={(e) => { const f = e.target.files?.[0]; if (f) pickFile('banner', f); }}
           />
-        </div>
-        <div className="px-5 pb-5 -mt-12">
-          <div
-            onClick={() => fileInputRef.current?.click()}
-            className="relative w-24 h-24 rounded-full border-4 border-lc-dark overflow-hidden cursor-pointer group bg-lc-olive"
-          >
-            {currentPicture ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={currentPicture} alt="" className="w-full h-full object-cover" />
-            ) : (
-              <div className="w-full h-full flex items-center justify-center text-lc-green text-3xl font-semibold">
-                {name ? name[0].toUpperCase() : '?'}
-              </div>
-            )}
-            <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 flex items-center justify-center text-xs text-lc-white transition">
-              Cambiar
-            </div>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/*"
-              className="hidden"
-              onChange={(e) => { const f = e.target.files?.[0]; if (f) pickFile('picture', f); }}
-            />
-          </div>
         </div>
       </section>
 

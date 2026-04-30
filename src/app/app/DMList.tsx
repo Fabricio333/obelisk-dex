@@ -49,9 +49,9 @@ export default function DMList({
   const visible = effectiveTab === 'follows' ? followsThreads : othersThreads;
 
   return (
-    <aside className="relative flex h-full w-full flex-col overflow-hidden border-l border-r border-t border-lc-border bg-lc-dark" style={{ borderTopLeftRadius: 12 }}>
-      <div className="flex shrink-0 items-center justify-between border-b border-lc-border p-3">
-        <h3 className="text-sm font-semibold text-lc-white">Direct Messages</h3>
+    <aside className="relative flex h-full w-full flex-col overflow-hidden bg-lc-dark">
+      <div className="flex h-14 shrink-0 items-center justify-between border-b border-lc-border px-4 shadow-sm">
+        <h3 className="truncate text-sm font-bold text-lc-white">Direct Messages</h3>
         <div className="flex items-center gap-1">
           <button
             onClick={() => alert('DM cache wipe is local-only; this client keeps DMs in memory only — refresh to clear.')}

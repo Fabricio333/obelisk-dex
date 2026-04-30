@@ -112,7 +112,7 @@ function RailTile({
           (emphasis
             ? active
               ? 'bg-lc-green text-lc-black ring-lc-green'
-              : 'bg-lc-olive/60 text-lc-green ring-lc-border hover:bg-lc-green hover:text-lc-black'
+              : 'bg-lc-green/10 text-lc-green ring-lc-green/30 hover:bg-lc-green hover:text-lc-black hover:ring-lc-green'
             : active
               ? 'bg-lc-green text-lc-black ring-lc-green'
               : 'bg-lc-card text-lc-white ring-lc-border hover:bg-lc-olive')
@@ -165,15 +165,18 @@ function RelayTile({
         onContextMenu={(e) => { e.preventDefault(); setMenu(true); }}
         title={url}
         aria-label={url}
-        style={{ background: active ? accent : undefined, color: active ? '#0a0a0a' : '#fff' }}
+        style={{
+          background: active && !(iconUrl && !iconFailed) ? accent : undefined,
+          color: active ? '#0a0a0a' : '#fff',
+        }}
         className={
-          'group/tile relative flex h-12 w-12 items-center justify-center rounded-2xl font-bold text-base ring-1 transition-all duration-150 hover:rounded-xl ' +
+          'group/tile relative flex h-12 w-12 items-center justify-center overflow-hidden rounded-2xl font-bold text-base ring-1 transition-all duration-150 hover:rounded-xl ' +
           (active
             ? 'ring-lc-green'
             : 'bg-lc-card text-lc-white ring-lc-border hover:rounded-xl')
         }
       >
-        {!active && (
+        {!active && !(iconUrl && !iconFailed) && (
           <span
             aria-hidden="true"
             style={{ background: accent }}
@@ -185,7 +188,7 @@ function RelayTile({
             src={iconUrl}
             alt=""
             onError={() => setIconFailed(true)}
-            className="relative h-8 w-8 rounded-lg object-cover"
+            className="relative h-full w-full object-cover"
           />
         ) : (
           <span className="relative">{initials}</span>

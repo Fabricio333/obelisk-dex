@@ -4,6 +4,7 @@ import { useMemo, useState } from 'react';
 import { useChatStore } from '@/store/chat';
 import { shortNpub } from '@/lib/mentions';
 import type { MemberInfo } from '@/lib/mentions';
+import { useNostrPresence, PRESENCE_WINDOW_MS } from '@/hooks/chat/useNostrPresence';
 import RoleIcon from './RoleIcon';
 
 interface MemberListProps {
@@ -98,8 +99,27 @@ function groupMembers(
 
 export default function MemberList({ profileCache }: MemberListProps) {
   const memberList = useChatStore(s => s.memberList);
-  const onlinePubkeys = useChatStore(s => s.onlinePubkeys);
+  const lastActivityAt = useChatStore(s => s.lastActivityAt);
+  // presenceTick is read so the component re-renders on the timer even when
+  // no new event has streamed in (otherwise users never fade to offline).
+  useChatStore(s => s.presenceTick);
   const [offlineCollapsed, setOfflineCollapsed] = useState(false);
+
+  const memberPubkeys = useMemo(
+    () => memberList.filter((m) => !m.isBot).map((m) => m.pubkey),
+    [memberList],
+  );
+  useNostrPresence(memberPubkeys);
+
+  const onlinePubkeys = useMemo(() => {
+    const cutoff = Date.now() - PRESENCE_WINDOW_MS;
+    const set = new Set<string>();
+    for (const pk of memberPubkeys) {
+      const at = lastActivityAt[pk];
+      if (at && at >= cutoff) set.add(pk);
+    }
+    return set;
+  }, [memberPubkeys, lastActivityAt]);
 
   const { bots, online, offline } = useMemo(
     () => groupMembers(memberList, onlinePubkeys),
@@ -107,10 +127,7 @@ export default function MemberList({ profileCache }: MemberListProps) {
   );
 
   const humanMembers = memberList.filter((m) => !m.isBot);
-  const onlineCount = humanMembers.reduce(
-    (acc, m) => acc + (onlinePubkeys.has(m.pubkey) ? 1 : 0),
-    0,
-  );
+  const onlineCount = onlinePubkeys.size;
 
   return (
     <div className="w-60 h-full bg-lc-dark border-l border-lc-border flex flex-col shrink-0">
