@@ -8,7 +8,7 @@
 # Env overrides:
 #   TUNNEL_NAME       default: obelisk-dex
 #   TUNNEL_HOSTNAME   default: dex.obelisk.ar
-#   PORT              default: 3000
+#   PORT              default: 3001  (3000 is reserved for obelisk.ar)
 #   ORIGIN_URL        default: http://127.0.0.1:$PORT
 #   SKIP_BUILD=1      reuse existing .next/
 #   SKIP_TUNNEL=1     skip cloudflared
@@ -25,7 +25,7 @@ fi
 
 TUNNEL_NAME="${TUNNEL_NAME:-obelisk-dex}"
 TUNNEL_HOST="${TUNNEL_HOSTNAME:-dex.obelisk.ar}"
-PORT="${PORT:-3000}"
+PORT="${PORT:-3001}"
 ORIGIN_URL="${ORIGIN_URL:-http://127.0.0.1:${PORT}}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 SKIP_TUNNEL="${SKIP_TUNNEL:-0}"
