@@ -11,6 +11,7 @@ const g = (id: string, name: string | null, about: string | null = null): JsGrou
   isPublic: true,
   isOpen: true,
   parent: null,
+  kind: 'text',
 });
 
 describe('searchGroups', () => {

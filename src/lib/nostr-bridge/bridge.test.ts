@@ -336,5 +336,5 @@ async function fakeRelayList(opts: {
 }
 
 function deliver(ev: NostrEvent) {
-  for (const sub of fake.state.subscriptions) if (matches(sub.filter, ev)) sub.sink(ev);
+  for (const sub of fake.state.subscriptions) if (matches(sub.filter as Filter, ev)) sub.sink(ev);
 }

@@ -13,7 +13,7 @@ function useSubscription<T>(
     bridge: Awaited<ReturnType<typeof getBridge>>,
     cb: (value: T) => void,
   ) => () => void,
-  initial: T,
+  initial: NoInfer<T>,
   deps: ReadonlyArray<unknown> = [],
 ): T {
   const [value, setValue] = useState<T>(initial);

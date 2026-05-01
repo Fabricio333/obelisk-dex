@@ -30,7 +30,7 @@ let mockGroups: JsGroup[] = [];
 
 const g = (id: string, name: string): JsGroup => ({
   id, name, about: null, picture: null, banner: null,
-  isPublic: true, isOpen: true, parent: null,
+  isPublic: true, isOpen: true, parent: null, kind: 'text',
 });
 
 beforeEach(() => {

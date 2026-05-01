@@ -65,6 +65,7 @@ import {
   type RelayBranding,
 } from '@/lib/relay-branding';
 import BlossomImageInput from '@/components/BlossomImageInput';
+import ActivityIndicator from '@/components/ActivityIndicator';
 
 type View =
   | { kind: 'group'; groupId: string }
@@ -126,7 +127,7 @@ export default function AppShell() {
     window.localStorage.setItem(SHOW_MEMBERS_KEY, showMembers ? '1' : '0');
   }, [showMembers]);
 
-  if (!isLoggedIn) return <LoginModal />;
+  if (!isLoggedIn) return (<><LoginModal /><ActivityIndicator /></>);
 
   const railMode: { kind: 'dm' } | { kind: 'relay'; url: string } =
     view.kind === 'dm' ? { kind: 'dm' } : { kind: 'relay', url: relay };
@@ -196,6 +197,7 @@ export default function AppShell() {
         </main>
         <FloatingUserPanel sidebarWidth={sidebarWidth} />
       </div>
+      <ActivityIndicator />
     </div>
   );
 }

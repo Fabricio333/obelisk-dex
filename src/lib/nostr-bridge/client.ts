@@ -27,6 +27,7 @@ import { parseRelayListMeta, parseInboxRelays } from '@/lib/nostr-read';
 import { TextCoercingWebSocket } from '@/lib/nostr-pool';
 import { cacheGet, cacheSet, cacheClearAll, cacheListIds } from './cache';
 import { resetAllClientState } from '@/lib/reset';
+import { pushActivity, resolveActivity, failActivity, trackActivity } from '@/lib/activity-log';
 import type {
   NostrBridge,
   JsGroup,
@@ -499,7 +500,14 @@ class BridgeImpl implements NostrBridge {
         else if (typeof window !== 'undefined') window.open(url, '_blank', 'width=600,height=700');
       },
     });
-    await signer.connect();
+    const connectId = pushActivity('Connecting to bunker', 'waiting for remote signer');
+    try {
+      await signer.connect();
+    } catch (e) {
+      failActivity(connectId, e instanceof Error ? e.message : String(e));
+      throw e;
+    }
+    resolveActivity(connectId);
     const pubKeyHex = await signer.getPublicKey();
     this.bunkerSigner = signer;
     this.session = {
@@ -536,13 +544,21 @@ class BridgeImpl implements NostrBridge {
     });
 
     let cancelled = false;
+    const scanId = pushActivity('Waiting for QR scan', 'open your Nostr signer to approve');
     const waitForConnection = async (): Promise<string> => {
       this.bunkerOnAuth = options?.onAuthUrl ?? null;
-      const signer = await BunkerSigner.fromURI(localSecret, uri, {
-        onauth: (url) => {
-          if (this.bunkerOnAuth) this.bunkerOnAuth(url);
-        },
-      }, 60000);
+      let signer;
+      try {
+        signer = await BunkerSigner.fromURI(localSecret, uri, {
+          onauth: (url) => {
+            if (this.bunkerOnAuth) this.bunkerOnAuth(url);
+          },
+        }, 60000);
+      } catch (e) {
+        failActivity(scanId, e instanceof Error ? e.message : String(e));
+        throw e;
+      }
+      resolveActivity(scanId, 'signer connected');
       if (cancelled) {
         try { signer.close(); } catch { /* ignore */ }
         throw new Error('NostrConnect cancelled');
@@ -571,7 +587,7 @@ class BridgeImpl implements NostrBridge {
     return {
       uri,
       waitForConnection,
-      cancel: () => { cancelled = true; },
+      cancel: () => { cancelled = true; failActivity(scanId, 'cancelled'); },
     };
   }
 
@@ -649,6 +665,10 @@ class BridgeImpl implements NostrBridge {
 
   async connect(): Promise<void> {
     this.connectionState.set('Connecting');
+    const activityId = pushActivity(
+      'Connecting to relays',
+      this.relays.length === 1 ? this.relays[0] : `${this.relays.length} relays`,
+    );
     try {
       // SimplePool.subscribe is lazy and synchronous — it doesn't wait for
       // the WebSocket handshake, so previously every relay (even bogus
@@ -697,8 +717,10 @@ class BridgeImpl implements NostrBridge {
         pending.metadata.forEach((pk) => this.ensureUserMetadata(pk));
       }
       this.connectionState.set('Connected');
+      resolveActivity(activityId, `${connectedCount}/${this.relays.length} relays`);
     } catch (e: unknown) {
       this.connectionState.set(`Error:${(e as Error).message}`);
+      failActivity(activityId, (e as Error).message);
       throw e;
     }
   }
@@ -1340,11 +1362,19 @@ class BridgeImpl implements NostrBridge {
     if (this.session.loginMethod === 'nip07') {
       const win = (window as any).nostr;
       if (!win) throw new Error('NIP-07 extension unavailable');
-      return (await win.signEvent(fullTemplate)) as NostrEvent;
+      return await trackActivity(
+        'Waiting for extension signature',
+        () => win.signEvent(fullTemplate) as Promise<NostrEvent>,
+        `kind ${template.kind}`,
+      );
     }
     if (this.session.loginMethod === 'bunker') {
       const b = await this.ensureBunkerSigner();
-      return (await b.signEvent(fullTemplate)) as NostrEvent;
+      return await trackActivity(
+        'Waiting for bunker signature',
+        () => b.signEvent(fullTemplate) as Promise<NostrEvent>,
+        `kind ${template.kind}`,
+      );
     }
     throw new Error(`Login method ${this.session.loginMethod} cannot sign events in this build`);
   }
@@ -1745,22 +1775,36 @@ class BridgeImpl implements NostrBridge {
   private async signAndPublish(template: { kind: number; content: string; tags: string[][]; created_at: number }, extraRelays: string[] = []): Promise<NostrEvent> {
     if (!this.session) throw new Error('Not logged in');
 
+    const signLabel =
+      this.session.loginMethod === 'nip07'
+        ? 'Waiting for extension signature'
+        : this.session.loginMethod === 'bunker'
+          ? 'Waiting for bunker signature'
+          : 'Signing event';
+    const signId = pushActivity(signLabel, `kind ${template.kind}`);
     let event: NostrEvent;
-    if (this.session.loginMethod === 'nsec' && this.session.privKeyHex) {
-      const sk = hexToBytes(this.session.privKeyHex);
-      event = finalizeEvent(template, sk);
-    } else if (this.session.loginMethod === 'nip07') {
-      const win = (window as any).nostr;
-      if (!win) throw new Error('NIP-07 extension unavailable');
-      event = (await win.signEvent({ ...template, pubkey: this.session.pubKeyHex })) as NostrEvent;
-    } else if (this.session.loginMethod === 'bunker') {
-      const b = await this.ensureBunkerSigner();
-      event = (await b.signEvent(template)) as NostrEvent;
-    } else {
-      throw new Error(`Login method ${this.session.loginMethod} cannot sign events in this build`);
+    try {
+      if (this.session.loginMethod === 'nsec' && this.session.privKeyHex) {
+        const sk = hexToBytes(this.session.privKeyHex);
+        event = finalizeEvent(template, sk);
+      } else if (this.session.loginMethod === 'nip07') {
+        const win = (window as any).nostr;
+        if (!win) throw new Error('NIP-07 extension unavailable');
+        event = (await win.signEvent({ ...template, pubkey: this.session.pubKeyHex })) as NostrEvent;
+      } else if (this.session.loginMethod === 'bunker') {
+        const b = await this.ensureBunkerSigner();
+        event = (await b.signEvent(template)) as NostrEvent;
+      } else {
+        throw new Error(`Login method ${this.session.loginMethod} cannot sign events in this build`);
+      }
+      resolveActivity(signId);
+    } catch (e) {
+      failActivity(signId, e instanceof Error ? e.message : String(e));
+      throw e;
     }
 
     const targetRelays = Array.from(new Set([...this.relays, ...extraRelays]));
+    const pubId = pushActivity('Publishing to relays', `kind ${template.kind} → ${targetRelays.length} relay(s)`);
     const results = await Promise.allSettled(
       this.pool.publish(targetRelays, event, { onauth: this.getAuthSigner() }),
     );
@@ -1774,8 +1818,11 @@ class BridgeImpl implements NostrBridge {
         })
         .filter(Boolean)
         .join('; ');
-      throw new Error(`Relay rejected event (kind ${event.kind}). ${reasons || 'no relay accepted'}`);
+      const msg = `Relay rejected event (kind ${event.kind}). ${reasons || 'no relay accepted'}`;
+      failActivity(pubId, msg);
+      throw new Error(msg);
     }
+    resolveActivity(pubId, `accepted by ${accepted.length}/${targetRelays.length}`);
     return event;
   }
 

@@ -11,7 +11,6 @@ vi.mock('@/lib/nostr-hooks', () => ({
 beforeEach(() => {
   mockUseNostrQuery.mockReset();
   mockUseNostrQuery.mockReturnValue({ events: [], loading: false, error: null });
-  // @ts-expect-error - injected jsdom global
   global.fetch = vi.fn();
 });
 
@@ -81,7 +80,6 @@ describe('useNostrUserSearch', () => {
 
   it('resolves NIP-05 identifiers via .well-known/nostr.json', async () => {
     const pk = 'd'.repeat(64);
-    // @ts-expect-error - test stub
     global.fetch = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({ names: { alice: pk } }),
