@@ -1,12 +1,15 @@
 'use client';
 
 import { useActivityLog, dismissActivity, type ActivityEntry } from '@/lib/activity-log';
+import { usePreferences } from '@/lib/preferences';
 
 export default function ActivityIndicator() {
   const items = useActivityLog();
+  const { showActivityIndicator } = usePreferences();
+  if (!showActivityIndicator) return null;
   if (items.length === 0) return null;
-  // Cap visible rows; prefer the most recent + any pending/error.
-  const visible = items.slice(0, 4);
+  // Only show the most recent activity row to avoid a stack of notifications.
+  const visible = items.slice(0, 1);
   return (
     <div
       className="pointer-events-none fixed bottom-3 right-3 z-[60] flex max-w-[min(22rem,calc(100vw-1.5rem))] flex-col gap-2"
