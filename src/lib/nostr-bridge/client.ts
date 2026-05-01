@@ -25,6 +25,8 @@ import { BunkerSigner, parseBunkerInput, createNostrConnectURI } from 'nostr-too
 import { generateSecretKey } from 'nostr-tools/pure';
 import { parseRelayListMeta, parseInboxRelays } from '@/lib/nostr-read';
 import { TextCoercingWebSocket } from '@/lib/nostr-pool';
+import { cacheGet, cacheSet, cacheClearAll, cacheListIds } from './cache';
+import { resetAllClientState } from '@/lib/reset';
 import type {
   NostrBridge,
   JsGroup,
@@ -205,6 +207,28 @@ class BridgeImpl implements NostrBridge {
    */
   membershipReadyByGroup = new StateStore<Record<string, boolean>>({});
   myFollows = new StateStore<string[]>([]);
+  /**
+   * `true` once the active NIP-46 bunker signer has completed its handshake
+   * with the bunker relay (or the user logged in via nsec/NIP-07 — those
+   * methods don't have an external signer to wait for, so they never set this
+   * to `true`; consumers that need a generic "ready to publish" flag should
+   * derive it from `(loginMethod !== 'bunker') || bunkerSignerReady`).
+   * Pre-warmed during {@link initialize} on page reload to avoid a cold
+   * `BunkerSigner.connect()` round-trip during the first NIP-42 AUTH.
+   */
+  bunkerSignerReady = new StateStore<boolean>(false);
+  /**
+   * Reactive mirror of `session?.pubKeyHex`. Plain `getPublicKey()` is a
+   * one-shot read; this store lets React components subscribe so they
+   * re-render on login/logout without manual wiring.
+   */
+  myPubkey = new StateStore<string | null>(null);
+  /**
+   * Reactive mirror of `session?.loginMethod`. Lets components derive
+   * "do I need to wait for a remote signer?" without reaching into
+   * the bridge's private session.
+   */
+  myLoginMethod = new StateStore<'nsec' | 'nip07' | 'bunker' | null>(null);
 
   // Pubkeys we've already requested kind:0 for, to avoid duplicate subscriptions.
   private metadataRequested = new Set<string>();
@@ -265,10 +289,48 @@ class BridgeImpl implements NostrBridge {
       const parsed = JSON.parse(raw) as PersistedSession;
       this.session = parsed;
       this.currentRelayUrl.set(parsed.relayUrl);
+      this.relays = [parsed.relayUrl];
       // Make sure the session relay is in the configured list.
       this.ensureRelayInList(parsed.relayUrl);
+      // Seed admin/member StateStores from localStorage so the sidebar paints
+      // last-known admin status instantly while the live REQ catches up.
+      // Stale-while-revalidate: arriving relay events overwrite via the
+      // newest-wins logic in ingestAdminMember.
+      this.seedCacheForRelay(parsed.relayUrl);
+      // For NIP-46 (bunker) sessions: pre-warm the BunkerSigner so the first
+      // NIP-42 AUTH challenge from the relay doesn't trigger a cold
+      // BunkerSigner.fromBunker + signer.connect() round-trip from inside
+      // the auth-signing callback. Many relays time out the AUTH window
+      // before the cold path completes, the REQ is dropped silently, the
+      // watchdog retries, and the user sees the "needs 2-3 refreshes" bug.
+      // Fire-and-forget on purpose: a flaky bunker relay must not block
+      // chat render — the lazy fallback in getAuthSigner still works.
+      if (parsed.loginMethod === 'bunker') {
+        void this.ensureBunkerSigner()
+          .then(() => this.bunkerSignerReady.set(true))
+          .catch((err) => {
+            console.warn(
+              '[bridge] bunker pre-warm failed; will retry lazily on first AUTH',
+              err,
+            );
+          });
+      }
+      // Order matters: connect() opens subscriptions, then we flip the gate.
+      // If we set isLoggedIn=true first, AppShell mounts and fires per-group
+      // REQs against an unauthenticated socket — relays drop them silently
+      // and the user is left needing 2-3 manual refreshes. See finalizeLogin
+      // and docs/auth-and-data-loading.md.
+      try {
+        await this.connect();
+      } catch {
+        // Connect failed (no relays reachable, etc.). Keep the persisted
+        // session in memory so a later switchRelay/retry can use it, but
+        // do NOT flip isLoggedIn — the UI will keep showing LoginModal.
+        return;
+      }
+      this.myPubkey.set(parsed.pubKeyHex);
+      this.myLoginMethod.set(parsed.loginMethod);
       this.isLoggedIn.set(true);
-      await this.connect();
     } catch {
       // bad storage, ignore
     }
@@ -302,10 +364,7 @@ class BridgeImpl implements NostrBridge {
       loginMethod: 'nsec',
       relayUrl: this.currentRelayUrl.get(),
     };
-    this.persist();
-    this.resetPoolForSessionChange();
-    this.isLoggedIn.set(true);
-    await this.connect();
+    await this.finalizeLogin();
   }
 
   async loginWithNip07(pubkeyHex: string): Promise<void> {
@@ -317,10 +376,76 @@ class BridgeImpl implements NostrBridge {
       loginMethod: 'nip07',
       relayUrl: this.currentRelayUrl.get(),
     };
+    await this.finalizeLogin();
+  }
+
+  /**
+   * Seed in-memory admin/member stores from {@link cacheGet} for `relay`.
+   *
+   * Called by {@link initialize} (page reload) and {@link switchRelay} (relay
+   * switch) so the sidebar paints last-known admin/member status instantly,
+   * before the relay's response to the live REQ has arrived. The live event
+   * (when it lands in {@link ingestAdminMember}) then overwrites the cache
+   * value via the existing `created_at`-newest-wins logic.
+   *
+   * Relay-scoped: each relay has its own admin/member lists, so we only seed
+   * for the active relay. Caches for other relays stay on disk untouched
+   * (they re-paint instantly if the user switches back).
+   */
+  private seedCacheForRelay(relay: string): void {
+    for (const groupId of cacheListIds(relay, KIND_GROUP_ADMINS)) {
+      const entry = cacheGet<string[]>(relay, KIND_GROUP_ADMINS, groupId);
+      if (entry) {
+        this.adminsByGroup.update((prev) => ({ ...prev, [groupId]: entry.value }));
+        this.membershipReadyByGroup.update((prev) =>
+          prev[groupId] ? prev : { ...prev, [groupId]: true },
+        );
+      }
+    }
+    for (const groupId of cacheListIds(relay, KIND_GROUP_MEMBERS)) {
+      const entry = cacheGet<string[]>(relay, KIND_GROUP_MEMBERS, groupId);
+      if (entry) {
+        this.membersByGroup.update((prev) => ({ ...prev, [groupId]: entry.value }));
+        this.membershipReadyByGroup.update((prev) =>
+          prev[groupId] ? prev : { ...prev, [groupId]: true },
+        );
+      }
+    }
+  }
+
+  /**
+   * Run the post-credential install sequence shared by all four login methods
+   * (nsec, NIP-07, bunker URL, NostrConnect QR) and the page-reload rehydration
+   * path in {@link initialize}.
+   *
+   * Order matters:
+   *   1. `persist()` — write session to localStorage so a refresh during the
+   *      connect handshake doesn't lose the credentials.
+   *   2. `resetPoolForSessionChange()` — fresh sockets so NIP-42 AUTH
+   *      renegotiates with the new key (see that method's JSDoc).
+   *   3. `await connect()` — relay handshake + open the global subscriptions
+   *      (group metadata, DMs, contact list, own profile). Resolves only
+   *      once at least one relay has handshaken and the global REQs are
+   *      issued. Throws on total failure.
+   *   4. `isLoggedIn.set(true)` — flip the gate **last**. AppShell mounts
+   *      with subscriptions already feeding store state, so there is no
+   *      empty-sidebar flash and components never fire REQs into an
+   *      unauthenticated socket.
+   *
+   * Pre-fix history: the old order set `isLoggedIn=true` *before* awaiting
+   * `connect()`. AppShell rendered the chat UI immediately, components
+   * subscribed to admin/member/messages while NIP-42 was still being
+   * negotiated, the relay dropped those REQs silently, and the user had to
+   * refresh 2-3 times for everything to populate. See
+   * `docs/auth-and-data-loading.md`.
+   */
+  private async finalizeLogin(): Promise<void> {
     this.persist();
     this.resetPoolForSessionChange();
-    this.isLoggedIn.set(true);
     await this.connect();
+    this.myPubkey.set(this.session?.pubKeyHex ?? null);
+    this.myLoginMethod.set(this.session?.loginMethod ?? null);
+    this.isLoggedIn.set(true);
   }
 
   /**
@@ -384,10 +509,8 @@ class BridgeImpl implements NostrBridge {
       bunkerUrl,
       bunkerLocalSecretHex: bytesToHex(localSecret),
     };
-    this.persist();
-    this.resetPoolForSessionChange();
-    this.isLoggedIn.set(true);
-    await this.connect();
+    this.bunkerSignerReady.set(true);
+    await this.finalizeLogin();
     return pubKeyHex;
   }
 
@@ -440,10 +563,8 @@ class BridgeImpl implements NostrBridge {
         bunkerUrl,
         bunkerLocalSecretHex: bytesToHex(localSecret),
       };
-      this.persist();
-      this.resetPoolForSessionChange();
-      this.isLoggedIn.set(true);
-      await this.connect();
+      this.bunkerSignerReady.set(true);
+      await this.finalizeLogin();
       return pubKeyHex;
     };
 
@@ -454,7 +575,22 @@ class BridgeImpl implements NostrBridge {
     };
   }
 
-  /** Lazily (re)construct the active BunkerSigner from the persisted session. */
+  /**
+   * Lazily (re)construct the active BunkerSigner from the persisted session.
+   *
+   * Contract:
+   *   - On a fresh login (`loginWithBunker` / `createNostrConnectSession`),
+   *     the signer is constructed and connected eagerly before this method is
+   *     ever consulted; `this.bunkerSigner` is already set.
+   *   - On page reload, `initialize()` pre-warms by calling this method once
+   *     fire-and-forget. After it resolves, subsequent NIP-42 AUTH callbacks
+   *     hit the cached signer instantly.
+   *   - If pre-warm failed (bunker relay down) or `initialize` hasn't run yet,
+   *     the first NIP-42 AUTH triggers this lazy path: parse bunker URL,
+   *     reconstruct localSecret, build BunkerSigner, await its connect()
+   *     handshake, then sign. This adds 1-3s of latency but is the fallback
+   *     of last resort.
+   */
   private async ensureBunkerSigner(): Promise<BunkerSigner> {
     if (this.bunkerSigner) return this.bunkerSigner;
     if (!this.session || this.session.loginMethod !== 'bunker' || !this.session.bunkerUrl || !this.session.bunkerLocalSecretHex) {
@@ -483,13 +619,26 @@ class BridgeImpl implements NostrBridge {
     if (typeof window !== 'undefined') {
       window.localStorage.removeItem(STORAGE_KEY);
       window.localStorage.removeItem(LEGACY_STORAGE_KEY);
+      // Wipe relay-scoped caches so the next identity doesn't paint with
+      // the previous one's admin/member lists. See cache.ts.
+      cacheClearAll();
     }
     this.dispose();
     this.pool = this.createPool();
     this.isLoggedIn.set(false);
+    this.bunkerSignerReady.set(false);
+    this.myPubkey.set(null);
+    this.myLoginMethod.set(null);
     this.connectionState.set('Disconnected');
     this.groups.set([]);
     this.messagesByGroup.set({});
+    this.adminsByGroup.set({});
+    this.membersByGroup.set({});
+    this.membershipReadyByGroup.set({});
+    // Clear chat / notification / voice / DM stores so the next user logging
+    // in on this browser doesn't inherit the previous account's data. See
+    // src/lib/reset.ts for the full enumeration.
+    resetAllClientState();
   }
 
   getPublicKey(): string | null {
@@ -574,7 +723,14 @@ class BridgeImpl implements NostrBridge {
     this.metadataRequested.clear();
     this.adminsByGroup.set({});
     this.membersByGroup.set({});
+    // Reset readiness too — the new relay hasn't delivered evidence yet.
+    // Without this, voice gates and member rails would still be marked
+    // "loaded" from the previous relay's data.
+    this.membershipReadyByGroup.set({});
     this.dmSubscribed = false;
+    // Re-paint instantly from disk for the new relay; live events will
+    // overwrite as they arrive. See {@link seedCacheForRelay}.
+    this.seedCacheForRelay(url);
     await this.connect();
   }
 
@@ -622,6 +778,15 @@ class BridgeImpl implements NostrBridge {
   }
   subscribeCurrentRelayUrl(cb: (url: string) => void): Unsubscribe {
     return this.currentRelayUrl.subscribe(cb);
+  }
+  subscribeMyPubkey(cb: (pubkey: string | null) => void): Unsubscribe {
+    return this.myPubkey.subscribe(cb);
+  }
+  subscribeMyLoginMethod(cb: (m: 'nsec' | 'nip07' | 'bunker' | null) => void): Unsubscribe {
+    return this.myLoginMethod.subscribe(cb);
+  }
+  subscribeBunkerSignerReady(cb: (ready: boolean) => void): Unsubscribe {
+    return this.bunkerSignerReady.subscribe(cb);
   }
   subscribeGroups(cb: (groups: ReadonlyArray<JsGroup>) => void): Unsubscribe {
     return this.groups.subscribe(cb);
@@ -1027,19 +1192,36 @@ class BridgeImpl implements NostrBridge {
    * can drop the sub silently. Symptoms: categories render but channels
    * don't; messages stay empty until the user refreshes 2-3 times.
    *
-   * If neither an EVENT nor an EOSE arrives within WATCHDOG_MS, we close
-   * the sub and re-issue it (with backoff, up to MAX_ATTEMPTS). EOSE alone
+   * If neither an EVENT nor an EOSE arrives within `watchdogMs`, we close
+   * the sub and re-issue it (with backoff, up to `maxAttempts`). EOSE alone
    * is enough to consider the sub alive — even if the relay has nothing
    * stored, EOSE proves the REQ is live and live events will stream.
+   *
+   * Tunable rationale:
+   *   - `watchdogMs`: how long to wait for *any* response before assuming
+   *     the REQ was dropped. 5000ms is a conservative default that tolerates
+   *     a slow NIP-42 round-trip + initial query on a backed-up relay. Lower
+   *     this for non-critical paths where a missed retry just means stale
+   *     UX for a few seconds.
+   *   - `maxAttempts`: how many times to retry before giving up. 4 with
+   *     exponential backoff (1s/2s/4s/8s) caps total wait at ~27s, which is
+   *     "I'll wait this long before I refuse to declare bankruptcy on this
+   *     subscription". Lower this for non-critical paths.
+   *
+   * Critical paths (group metadata, group messages, admin/member, DMs,
+   * contact list) keep the 5000/4 default — losing them means an empty
+   * UI. Non-critical paths (kind:0 metadata, reactions) override with
+   * tighter values: a missed reaction just delays an emoji badge.
    */
   private subscribeWatched(
     relays: string[],
     filter: Filter,
     onevent: (ev: NostrEvent) => void,
     oneose?: () => void,
+    options?: { watchdogMs?: number; maxAttempts?: number },
   ): { close: () => void } {
-    const WATCHDOG_MS = 5000;
-    const MAX_ATTEMPTS = 4;
+    const WATCHDOG_MS = options?.watchdogMs ?? 5000;
+    const MAX_ATTEMPTS = options?.maxAttempts ?? 4;
     let attempt = 0;
     let activeSub: { close: () => void } | null = null;
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -1169,7 +1351,15 @@ class BridgeImpl implements NostrBridge {
   private subscribeKind0(pubkey: string): void {
     const filter: Filter = { kinds: [KIND_USER_METADATA], authors: [pubkey] };
     const relays = Array.from(new Set([...this.relays, ...PROFILE_RELAYS]));
-    const sub = this.subscribeWatched(relays, filter, (ev) => this.ingestUserMetadata(ev));
+    // Non-critical path: a missing kind:0 just shows the npub instead of a
+    // display name. Tighter watchdog/retry to fail fast and free socket budget.
+    const sub = this.subscribeWatched(
+      relays,
+      filter,
+      (ev) => this.ingestUserMetadata(ev),
+      undefined,
+      { watchdogMs: 3000, maxAttempts: 2 },
+    );
     this.subs.push(sub);
   }
 
@@ -1177,7 +1367,14 @@ class BridgeImpl implements NostrBridge {
     if (this.reactionSubscribedGroups.has(groupId)) return;
     this.reactionSubscribedGroups.add(groupId);
     const filter: Filter = { kinds: [KIND_REACTION], '#h': [groupId], limit: 500 };
-    const sub = this.subscribeWatched(this.relays, filter, (ev) => this.ingestReaction(groupId, ev));
+    // Non-critical path: a missing reaction event just delays an emoji badge.
+    const sub = this.subscribeWatched(
+      this.relays,
+      filter,
+      (ev) => this.ingestReaction(groupId, ev),
+      undefined,
+      { watchdogMs: 3000, maxAttempts: 2 },
+    );
     this.subs.push(sub);
   }
 
@@ -1207,6 +1404,10 @@ class BridgeImpl implements NostrBridge {
     const pubkeys = ev.tags.filter((t) => t[0] === 'p').map((t) => t[1]);
     const store = ev.kind === KIND_GROUP_ADMINS ? this.adminsByGroup : this.membersByGroup;
     store.update((prev) => ({ ...prev, [groupId]: pubkeys }));
+    // Persist for next reload — paints instantly before the relay round-trip
+    // completes. See cache.ts. Scoped by relay so cross-relay browsing
+    // doesn't leak admin lists.
+    cacheSet(this.currentRelayUrl.get(), ev.kind, groupId, pubkeys);
     // Positive signal: the relay has delivered membership data for this
     // group, even if the list is empty. Consumers (voice gate) can now
     // distinguish "not loaded yet" from "loaded and you're not in it".
@@ -1290,6 +1491,15 @@ class BridgeImpl implements NostrBridge {
     // Start streaming messages immediately so opening the channel doesn't
     // wait on a fresh REQ round-trip — the store already has them.
     this.subscribeGroupMessages(groupId);
+    // Same logic for admins/members (kinds 39001/39002): without this, the
+    // sidebar's "I'm an admin of X" badge can't paint until the user opens
+    // each group (because the per-group REQ only fired when ChatPanel mounted
+    // and called useAdmins/useMembers). Eager subscription means admin status
+    // resolves on first paint for every visible group. subscribeAdminMember
+    // is idempotent — a later useAdmins call from a chat panel is a no-op.
+    // TODO(bridgeCache): also write the relay's reply through cacheSet so a
+    // reload paints from cache instantly.
+    this.subscribeAdminMember(groupId);
     // Maintain parent → children index so the sidebar can render nesting.
     this.childrenByParent.update((prev) => {
       const next: Record<string, string[]> = { ...prev };

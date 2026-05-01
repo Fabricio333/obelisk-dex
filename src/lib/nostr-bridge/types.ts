@@ -104,6 +104,24 @@ export interface NostrBridge {
   subscribeIsLoggedIn(cb: (v: boolean) => void): Unsubscribe;
   subscribeConnectionState(cb: (label: string) => void): Unsubscribe;
   subscribeCurrentRelayUrl(cb: (url: string) => void): Unsubscribe;
+  /**
+   * The local user's pubkey hex (from the active session), or `null` when
+   * logged out. Reactive: subscribers receive updates on login/logout.
+   */
+  subscribeMyPubkey(cb: (pubkey: string | null) => void): Unsubscribe;
+  /**
+   * The active session's login method, or `null` when logged out. Reactive.
+   * Used to decide whether to wait for an external NIP-46 bunker signer.
+   */
+  subscribeMyLoginMethod(cb: (m: 'nsec' | 'nip07' | 'bunker' | null) => void): Unsubscribe;
+  /**
+   * `true` once the active NIP-46 bunker signer has handshaken with the
+   * bunker relay. Pre-warmed during {@link initialize} on page reload.
+   * Always `false` for nsec/NIP-07 sessions (those don't have an external
+   * signer to wait for) — derive a generic "ready to publish" flag as
+   * `(loginMethod !== 'bunker') || bunkerSignerReady`.
+   */
+  subscribeBunkerSignerReady(cb: (ready: boolean) => void): Unsubscribe;
   subscribeGroups(cb: (groups: ReadonlyArray<JsGroup>) => void): Unsubscribe;
   subscribeMessages(groupId: string, cb: (msgs: ReadonlyArray<JsMessage>) => void): Unsubscribe;
   subscribeUserMetadata(pubkey: string, cb: (meta: JsUserMetadata | null) => void): Unsubscribe;

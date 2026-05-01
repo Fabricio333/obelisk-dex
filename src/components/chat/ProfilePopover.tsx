@@ -4,10 +4,9 @@ import { Fragment, useEffect, useMemo, useRef, type ReactNode } from 'react';
 import { useChatStore } from '@/store/chat';
 import { useToastStore } from '@/store/toast';
 import { useModerationStore } from '@/store/moderation';
-import { useAuthStore } from '@/store/auth';
 import { formatPubkey, pubkeyToNpub } from '@/lib/nostr';
 import { nip19 } from 'nostr-tools';
-import { useUserMetadata } from '@/lib/nostr-bridge';
+import { useMyPubkey, useUserMetadata } from '@/lib/nostr-bridge';
 import type { MemberInfo } from '@/lib/mentions';
 import {
   replaceShortcodes,
@@ -100,7 +99,7 @@ export default function ProfilePopover({ pubkey, onClose }: {
     };
   }, [memberFromList, meta, pubkey]);
   const panelRef = useRef<HTMLDivElement>(null);
-  const viewerPubkey = useAuthStore((s) => s.user?.pubkey);
+  const viewerPubkey = useMyPubkey();
   const isSelf = viewerPubkey === pubkey;
   const muted = useModerationStore((s) => s.mutedPubkeys.includes(pubkey));
   const blocked = useModerationStore((s) => s.blockedPubkeys.includes(pubkey));

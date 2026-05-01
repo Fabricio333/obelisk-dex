@@ -5,7 +5,6 @@ import WotHero from './WotHero';
 import FutureRelaysHero from './FutureRelaysHero';
 import BitcoinZapsHero from './BitcoinZapsHero';
 import AdminCliHero from './AdminCliHero';
-import AuthFlowDiagram from './diagrams/AuthFlowDiagram';
 import WotGraphDiagram from './diagrams/WotGraphDiagram';
 import RelayGroupsDiagram from './diagrams/RelayGroupsDiagram';
 import ZapFlowDiagram from './diagrams/ZapFlowDiagram';
@@ -20,7 +19,6 @@ export const HERO_REGISTRY: Record<string, ComponentType> = {
 };
 
 export const DIAGRAM_REGISTRY: Record<string, ComponentType> = {
-  'auth-flow': AuthFlowDiagram,
   'wot-graph': WotGraphDiagram,
   'relay-groups': RelayGroupsDiagram,
   'zap-flow': ZapFlowDiagram,

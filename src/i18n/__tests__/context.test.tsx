@@ -26,7 +26,7 @@ describe('LocaleProvider + useTranslation', () => {
       </LocaleProvider>
     );
     expect(screen.getByTestId('locale').textContent).toBe('en');
-    expect(screen.getByTestId('translated').textContent).toBe('The Discord alternative with');
+    expect(screen.getByTestId('translated').textContent).toBe('Discord-style group chat,');
   });
 
   it('defaults to Spanish', () => {
@@ -36,7 +36,7 @@ describe('LocaleProvider + useTranslation', () => {
       </LocaleProvider>
     );
     expect(screen.getByTestId('locale').textContent).toBe('es');
-    expect(screen.getByTestId('translated').textContent).toBe('La alternativa a Discord con');
+    expect(screen.getByTestId('translated').textContent).toBe('Chat grupal estilo Discord,');
   });
 
   it('switches locale on setLocale', async () => {
@@ -47,12 +47,12 @@ describe('LocaleProvider + useTranslation', () => {
       </LocaleProvider>
     );
 
-    expect(screen.getByTestId('translated').textContent).toBe('La alternativa a Discord con');
+    expect(screen.getByTestId('translated').textContent).toBe('Chat grupal estilo Discord,');
 
     await user.click(screen.getByText('toggle'));
 
     expect(screen.getByTestId('locale').textContent).toBe('en');
-    expect(screen.getByTestId('translated').textContent).toBe('The Discord alternative with');
+    expect(screen.getByTestId('translated').textContent).toBe('Discord-style group chat,');
   });
 
   it('sets cookie when locale changes', async () => {

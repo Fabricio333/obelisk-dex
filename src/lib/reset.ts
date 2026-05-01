@@ -7,10 +7,9 @@ import { _resetFollows } from '@/lib/dm/follows';
 import { _resetProfileCache } from '@/lib/dm/profile-cache';
 import { _resetRelayCache } from '@/lib/dm/relay-list-cache';
 
-// Clears all per-identity client state. Called on logout and whenever
-// setUser/restoreSession observes the pubkey changing — so the next user
-// never sees the previous account's servers, channels, messages,
-// notification counters, or an already-joined voice channel.
+// Clears all per-identity client state. Called from `BridgeImpl.logout()`
+// so the next user never sees the previous account's servers, channels,
+// messages, notification counters, or an already-joined voice channel.
 //
 // Browser-level things that are *not* identity-scoped (e.g. the Notification
 // permission flag) are preserved by the individual store resets.

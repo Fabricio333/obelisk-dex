@@ -14,8 +14,15 @@
 #   ORIGIN_URL         default: http://127.0.0.1:$PORT
 #   SKIP_TUNNEL=1      only start dev server, no cloudflared
 #   FORCE_KILL=1       kill anything on $PORT instead of falling back
+#
+# Subcommands:
+#   ./scripts/dev-raise.sh           start (default)
+#   ./scripts/dev-raise.sh status    show what's running for this project
+#   ./scripts/dev-raise.sh stop      stop this project's dev server + tunnel
 
 set -u
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 
 if [ -f "$(dirname "$0")/../.env" ]; then
   set -a
@@ -47,6 +54,75 @@ green() { printf "\033[0;32m%s\033[0m\n" "$*"; }
 blue()  { printf "\033[0;34m%s\033[0m\n" "$*"; }
 dim()   { printf "\033[2m%s\033[0m\n"     "$*"; }
 step()  { printf "\n\033[1;36m▸ %s\033[0m\n" "$*"; }
+
+# Return the cwd of a pid (resolves symlinks). Empty on failure.
+pid_cwd() {
+  lsof -a -p "$1" -d cwd -Fn 2>/dev/null | awk '/^n/{print substr($0,2); exit}'
+}
+
+# Is this pid a `next dev` rooted in THIS repo?
+is_our_next_dev() {
+  local pid="$1" cmd cwd
+  cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+  case "$cmd" in
+    *"next dev"*|*"next-server"*|*"node "*"next"*) ;;
+    *) return 1 ;;
+  esac
+  cwd=$(pid_cwd "$pid")
+  [ -n "$cwd" ] && [ "$cwd" = "$REPO_ROOT" ]
+}
+
+# Subcommand dispatch ────────────────────────────────────────────
+SUB="${1:-start}"
+case "$SUB" in
+  start) ;;
+  status)
+    pids=$(lsof -tiTCP -sTCP:LISTEN 2>/dev/null | sort -u || true)
+    found_dev=""
+    for pid in $pids; do
+      if is_our_next_dev "$pid"; then
+        port=$(lsof -p "$pid" -iTCP -sTCP:LISTEN -P -n 2>/dev/null | awk 'NR>1{split($9,a,":"); print a[length(a)]; exit}')
+        green "next dev: pid $pid on :$port  (cwd $REPO_ROOT)"
+        found_dev=1
+        break
+      fi
+    done
+    [ -z "$found_dev" ] && dim "next dev: not running for this repo"
+    if pgrep -f "cloudflared .* tunnel" >/dev/null 2>&1; then
+      pgrep -af "cloudflared .* tunnel" | while read -r line; do green "tunnel: $line"; done
+    else
+      dim "tunnel: no cloudflared running"
+    fi
+    exit 0
+    ;;
+  stop)
+    blue "Stopping Obelisk dev + tunnel…"
+    pids=$(lsof -tiTCP -sTCP:LISTEN 2>/dev/null | sort -u || true)
+    for pid in $pids; do
+      if is_our_next_dev "$pid"; then
+        blue "killing next dev pid $pid"
+        kill -TERM "$pid" 2>/dev/null
+        pkill -TERM -P "$pid" 2>/dev/null
+      fi
+    done
+    if pgrep -f "cloudflared .* tunnel" >/dev/null 2>&1; then
+      blue "killing cloudflared"
+      pkill -TERM -f "cloudflared .* tunnel" 2>/dev/null || true
+    fi
+    sleep 1
+    green "Done."
+    exit 0
+    ;;
+  -h|--help|help)
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+  *)
+    red "Unknown subcommand: $SUB"
+    echo "Usage: $0 [start|status|stop]"
+    exit 2
+    ;;
+esac
 
 # ── Pre-flight ───────────────────────────────────────────────────
 step "Pre-flight"
@@ -81,22 +157,19 @@ fi
 step "Dev server on port $PORT"
 DEV_ALREADY_RUNNING=0
 
-is_next_dev() {
-  case "$1" in
-    *"next dev"*|*"next-server"*|*"node "*"next"*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 pids=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
 
 if [ -n "$pids" ]; then
-  cmd=$(ps -p "$(echo "$pids" | head -1)" -o command= 2>/dev/null || true)
-  if is_next_dev "$cmd"; then
-    green "Dev server already on $PORT — reusing (pid $(echo "$pids" | head -1))."
+  pid1=$(echo "$pids" | head -1)
+  cmd=$(ps -p "$pid1" -o command= 2>/dev/null || true)
+  cwd=$(pid_cwd "$pid1")
+  if is_our_next_dev "$pid1"; then
+    green "Dev server already on $PORT — reusing this repo's next dev (pid $pid1)."
     DEV_ALREADY_RUNNING=1
   else
-    blue "Port $PORT held by: $cmd"
+    blue "Port $PORT held by another process:"
+    dim "  pid $pid1  cmd: $cmd"
+    [ -n "$cwd" ] && dim "  cwd: $cwd"
     if [ "$FORCE_KILL" = "1" ]; then
       blue "FORCE_KILL=1 — killing."
       kill $pids 2>/dev/null || true; sleep 1
@@ -111,14 +184,19 @@ if [ -n "$pids" ]; then
         if [ -z "$cpids" ]; then
           found="$cand"; PORT="$cand"; green "Using free port $cand."; break
         fi
-        ccmd=$(ps -p "$(echo "$cpids" | head -1)" -o command= 2>/dev/null || true)
-        if is_next_dev "$ccmd"; then
+        cpid1=$(echo "$cpids" | head -1)
+        if is_our_next_dev "$cpid1"; then
           PORT="$cand"; DEV_ALREADY_RUNNING=1; found="$cand"
-          green "Next dev already on $cand — reusing."
+          green "Our next dev already on $cand — reusing (pid $cpid1)."
           break
         fi
       done
-      [ -z "$found" ] && { red "No free port. Set FORCE_KILL=1."; exit 1; }
+      if [ -z "$found" ]; then
+        red "No free port. Options:"
+        red "  • FORCE_KILL=1 npm run dev:raise   (kill the foreign process on :$PORT)"
+        red "  • PORT=3100 npm run dev:raise      (use a different port)"
+        exit 1
+      fi
     fi
   fi
 fi

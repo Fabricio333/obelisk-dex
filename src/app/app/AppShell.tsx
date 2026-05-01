@@ -1690,7 +1690,7 @@ function ChatPanel({
   );
 }
 
-const QUICK_REACTIONS = ['+', '🔥', '⚡', '😂', '🤔'];
+const QUICK_REACTIONS = ['🔥', '⚡', '😂', '🤔'];
 
 function CopyInviteLinkButton({ groupId }: { groupId: string }) {
   const [copied, setCopied] = useState(false);
@@ -1966,19 +1966,23 @@ function MessageRow({
           </button>
         </div>
         {/* ⋯ menu trigger */}
-        <button
-          onClick={(e) => { e.stopPropagation(); setMenuOpen((v) => !v); setPickerOpen(false); }}
+        <div
           className={
-            'rounded-md border border-lc-border bg-lc-dark px-2 py-0.5 text-sm text-lc-muted shadow-md hover:bg-lc-card hover:text-lc-white ' +
+            'rounded-md border border-lc-border bg-lc-dark p-0.5 shadow-md ' +
             (menuOpen || panelPinned ? 'flex' : 'hidden group-hover:flex')
           }
-          title="More actions"
-          aria-label="More actions"
-          aria-haspopup="menu"
-          aria-expanded={menuOpen}
         >
-          ⋯
-        </button>
+          <button
+            onClick={(e) => { e.stopPropagation(); setMenuOpen((v) => !v); setPickerOpen(false); }}
+            className="rounded px-1.5 py-0.5 text-sm text-lc-muted hover:bg-lc-card hover:text-lc-white"
+            title="More actions"
+            aria-label="More actions"
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+          >
+            ⋯
+          </button>
+        </div>
         {menuOpen && (
           <div
             role="menu"

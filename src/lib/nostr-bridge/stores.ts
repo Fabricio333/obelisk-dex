@@ -45,6 +45,48 @@ export function useCurrentRelayUrl(): string {
   return useSubscription((b, cb) => b.subscribeCurrentRelayUrl(cb), '');
 }
 
+/**
+ * The local user's pubkey hex, or `null` when logged out. Single source of
+ * truth for "who am I" — replaces the legacy `useAuthStore(s => s.profile.pubkey)`.
+ */
+export function useMyPubkey(): string | null {
+  return useSubscription<string | null>((b, cb) => b.subscribeMyPubkey(cb), null);
+}
+
+/**
+ * `true` once the active NIP-46 bunker signer has handshaken with its
+ * bunker relay. For nsec/NIP-07 sessions this stays `false` (no external
+ * signer to wait for). UI components that need a generic "ready to publish"
+ * gate should use {@link useSignerReady} instead.
+ */
+export function useBunkerSignerReady(): boolean {
+  return useSubscription((b, cb) => b.subscribeBunkerSignerReady(cb), false);
+}
+
+/**
+ * The active session's login method, or `null` when logged out.
+ */
+export function useMyLoginMethod(): 'nsec' | 'nip07' | 'bunker' | null {
+  return useSubscription<'nsec' | 'nip07' | 'bunker' | null>(
+    (b, cb) => b.subscribeMyLoginMethod(cb),
+    null,
+  );
+}
+
+/**
+ * Generic "the bridge can sign and publish events for the active user".
+ * `true` for nsec/NIP-07 once logged in; for bunker it additionally requires
+ * the BunkerSigner to have handshaken with its bunker relay.
+ */
+export function useSignerReady(): boolean {
+  const loggedIn = useIsLoggedIn();
+  const method = useMyLoginMethod();
+  const bunkerReady = useBunkerSignerReady();
+  if (!loggedIn) return false;
+  if (method === 'bunker') return bunkerReady;
+  return method !== null;
+}
+
 export function useConfiguredRelays(): ReadonlyArray<string> {
   return useSubscription((b, cb) => b.subscribeConfiguredRelays(cb), []);
 }

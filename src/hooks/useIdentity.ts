@@ -1,49 +1,53 @@
 /**
- * Single React-side surface for identity state. Consumers should prefer
- * this over reading individual auth-store fields, so when we eventually
- * lift the underlying state into a dedicated identity store the swap
- * happens here only.
+ * Single React-side surface for identity state. Backed by the
+ * `nostr-bridge` (NIP-29 SimplePool wrapper). There is no server-validated
+ * cookie or backend session anymore — Obelisk is fully Nostr/relays-only,
+ * and identity comes straight from the in-memory bridge session that's
+ * persisted to localStorage on login.
  *
- * Non-React callers (`dm/dm.ts`, `nostr-read.ts`, `nostr.ts` login flows)
- * keep using `useAuthStore.getState()` for now — that's the same store
- * this hook reads from.
+ * Consumers should prefer this hook over reading individual bridge
+ * subscriptions when they need a snapshot. For single-field reads,
+ * use the bridge hooks directly (`useMyPubkey`, `useIsLoggedIn`, etc.)
+ * to minimize re-renders.
  */
 
 'use client';
 
-import { useAuthStore } from '@/store/auth';
-import type { LoginMethod, NostrProfile } from '@/lib/nostr';
+import {
+  useIsLoggedIn,
+  useMyPubkey,
+  useMyLoginMethod,
+  useUserMetadata,
+  useSignerReady,
+  type JsUserMetadata,
+} from '@/lib/nostr-bridge';
 
 export interface IdentitySnapshot {
-  /** Backend-cookie-validated pubkey, or null if unauthenticated. */
+  /** Active session pubkey hex, or `null` when logged out. */
   pubkey: string | null;
-  /** Cached profile (display name, avatar, etc.). null until restoreSession. */
-  profile: NostrProfile | null;
-  /** Login method used for this session — drives signer-restore branch. */
-  loginMethod: LoginMethod | null;
-  /** Backend session is valid. */
+  /**
+   * Kind:0 metadata (display name, avatar, etc.) for the local user, or
+   * `null` if not yet fetched. The bridge resolves this on login.
+   */
+  profile: JsUserMetadata | null;
+  /** Login method used for the active session. */
+  loginMethod: 'nsec' | 'nip07' | 'bunker' | null;
+  /** The bridge has a connected relay session for the current user. */
   isConnected: boolean;
-  /** NDK signer is live and can encrypt/sign/publish. Reactive. */
+  /**
+   * The bridge can sign + publish. Always `true` for nsec/NIP-07 once
+   * logged in; for NIP-46 bunker it additionally requires the BunkerSigner
+   * to have handshaken with its bunker relay.
+   */
   signerReady: boolean;
-  /** Auth store has finished its persist-rehydration cycle. */
-  hydrated: boolean;
 }
 
 export function useIdentity(): IdentitySnapshot {
-  // Each `useAuthStore(selector)` call subscribes to that one slice — React
-  // re-renders the consumer only when the selected value changes.
-  const profile = useAuthStore((s) => s.profile);
-  const loginMethod = useAuthStore((s) => s.loginMethod);
-  const isConnected = useAuthStore((s) => s.isConnected);
-  const signerReady = useAuthStore((s) => s.signerReady);
-  const hydrated = useAuthStore((s) => s._hasHydrated);
+  const pubkey = useMyPubkey();
+  const profile = useUserMetadata(pubkey);
+  const loginMethod = useMyLoginMethod();
+  const isConnected = useIsLoggedIn();
+  const signerReady = useSignerReady();
 
-  return {
-    pubkey: profile?.pubkey ?? null,
-    profile,
-    loginMethod,
-    isConnected,
-    signerReady,
-    hydrated,
-  };
+  return { pubkey, profile, loginMethod, isConnected, signerReady };
 }

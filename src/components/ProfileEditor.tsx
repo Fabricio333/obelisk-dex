@@ -2,9 +2,8 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { useTranslation } from '@/i18n/context';
-import { fetchCurrentKind0, publishProfile, getNDK } from '@/lib/nostr';
 import { uploadToBlossom } from '@/lib/blossom';
-import { useAuthStore } from '@/store/auth';
+import { getBridge, useMyPubkey, useUserMetadata } from '@/lib/nostr-bridge';
 
 interface ProfileEditorProps {
   mode: 'setup' | 'edit';
@@ -36,15 +35,22 @@ function randomName(): string {
 
 export default function ProfileEditor({ mode, onComplete, onSkip, embedded = false }: ProfileEditorProps) {
   const { t } = useTranslation();
-  const profile = useAuthStore((s) => s.profile);
-  const { syncProfile } = useAuthStore();
+  const myPubkey = useMyPubkey();
+  // The bridge auto-resolves kind:0 for the active user on login, so this
+  // populates the form prefill in edit mode without an extra fetch round-trip.
+  // The bridge also re-merges unknown kind:0 fields internally during
+  // editUserMetadata, so we don't need a separate fetchCurrentKind0 here.
+  const profile = useUserMetadata(myPubkey);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const [name, setName] = useState('');
-  const [pictureUrl, setPictureUrl] = useState('');
-  const [about, setAbout] = useState('');
-  const [existingMeta, setExistingMeta] = useState<Record<string, unknown>>({});
-  const [loading, setLoading] = useState(mode === 'edit');
+  const initialName = profile?.displayName || profile?.name || '';
+  const initialPicture = profile?.picture || '';
+  const initialAbout = profile?.about || '';
+
+  const [name, setName] = useState(initialName);
+  const [pictureUrl, setPictureUrl] = useState(initialPicture);
+  const [about, setAbout] = useState(initialAbout);
+  const [snapshot, setSnapshot] = useState({ name: initialName, picture: initialPicture, about: initialAbout });
   const [publishing, setPublishing] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
@@ -52,18 +58,20 @@ export default function ProfileEditor({ mode, onComplete, onSkip, embedded = fal
   const [pictureFile, setPictureFile] = useState<File | null>(null);
   const [picturePreview, setPicturePreview] = useState<string | null>(null);
 
-  // In edit mode, load current kind 0 from relays
+  // In edit mode, hydrate the form once the bridge has resolved the local
+  // user's kind:0. `useUserMetadata` returns null until that lands.
   useEffect(() => {
-    if (mode === 'edit' && profile?.pubkey) {
-      fetchCurrentKind0(profile.pubkey).then((meta) => {
-        setExistingMeta(meta);
-        setName((meta.display_name as string) || (meta.name as string) || '');
-        setPictureUrl((meta.picture as string) || (meta.image as string) || '');
-        setAbout((meta.about as string) || '');
-        setLoading(false);
-      });
-    }
-  }, [mode, profile?.pubkey]);
+    if (mode !== 'edit' || !profile) return;
+    const next = {
+      name: profile.displayName || profile.name || '',
+      picture: profile.picture || '',
+      about: profile.about || '',
+    };
+    setName(next.name);
+    setPictureUrl(next.picture);
+    setAbout(next.about);
+    setSnapshot(next);
+  }, [mode, profile]);
 
   // Clean up object URL on unmount
   useEffect(() => {
@@ -98,9 +106,7 @@ export default function ProfileEditor({ mode, onComplete, onSkip, embedded = fal
 
   const hasChanges = mode === 'setup'
     ? nameValid
-    : name !== ((existingMeta.display_name as string) || (existingMeta.name as string) || '') ||
-      pictureFile !== null ||
-      about !== ((existingMeta.about as string) || '');
+    : name !== snapshot.name || pictureFile !== null || about !== snapshot.about;
 
   const handleSubmit = () => {
     if (!nameValid) return;
@@ -115,9 +121,6 @@ export default function ProfileEditor({ mode, onComplete, onSkip, embedded = fal
     setPublishing(true);
     setError(null);
     try {
-      const ndk = getNDK();
-      if (!ndk.signer) throw new Error('No signer');
-
       // Upload picture to Blossom if a file was selected
       let finalPictureUrl = pictureUrl;
       if (pictureFile) {
@@ -129,15 +132,13 @@ export default function ProfileEditor({ mode, onComplete, onSkip, embedded = fal
         }
       }
 
-      const publishFields: Record<string, string> = {
+      const bridge = await getBridge();
+      await bridge.editUserMetadata({
         name: name.trim(),
-        display_name: name.trim(),
-      };
-      if (finalPictureUrl) publishFields.picture = finalPictureUrl;
-      if (about.trim()) publishFields.about = about.trim();
-
-      await publishProfile(publishFields);
-      await syncProfile();
+        displayName: name.trim(),
+        ...(finalPictureUrl ? { picture: finalPictureUrl } : {}),
+        ...(about.trim() ? { about: about.trim() } : {}),
+      });
 
       onComplete();
     } catch (err) {
@@ -157,6 +158,11 @@ export default function ProfileEditor({ mode, onComplete, onSkip, embedded = fal
 
   const bodyPad = embedded ? 'px-0' : 'px-6';
   const formPad = embedded ? 'py-0' : 'p-6';
+
+  // In edit mode, show a skeleton until the bridge has resolved kind:0 for
+  // the active user. setup mode never blocks — there's no existing profile
+  // to load.
+  const loading = mode === 'edit' && profile === null && myPubkey !== null;
 
   const body = (
     <>
@@ -200,10 +206,10 @@ export default function ProfileEditor({ mode, onComplete, onSkip, embedded = fal
             <p className="text-sm text-lc-muted">{t('profileEditor.confirmDesc')}</p>
 
             <div className="space-y-2 p-3 bg-lc-black rounded-xl border border-lc-border">
-              {name !== ((existingMeta.display_name as string) || (existingMeta.name as string) || '') && (
+              {name !== snapshot.name && (
                 <div className="text-xs">
                   <span className="text-lc-muted">{t('profileEditor.displayName')}:</span>{' '}
-                  <span className="text-red-400 line-through">{(existingMeta.display_name as string) || (existingMeta.name as string) || '—'}</span>{' '}
+                  <span className="text-red-400 line-through">{snapshot.name || '—'}</span>{' '}
                   <span className="text-lc-green">{name}</span>
                 </div>
               )}
@@ -213,7 +219,7 @@ export default function ProfileEditor({ mode, onComplete, onSkip, embedded = fal
                   <span className="text-lc-green">{t('profileEditor.changed')}</span>
                 </div>
               )}
-              {about !== ((existingMeta.about as string) || '') && (
+              {about !== snapshot.about && (
                 <div className="text-xs">
                   <span className="text-lc-muted">{t('profileEditor.aboutLabel')}:</span>{' '}
                   <span className="text-lc-green">{t('profileEditor.changed')}</span>

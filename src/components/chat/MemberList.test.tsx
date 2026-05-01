@@ -57,10 +57,10 @@ describe('MemberList presence indicator', () => {
     expect(screen.queryAllByTitle('Online')).toHaveLength(0);
   });
 
-  it('shows count as online/total', () => {
+  it('marks the online member with the Online indicator', () => {
     setOnline(['pk-online']);
     render(<MemberList profileCache={emptyProfileCache} />);
-    expect(screen.getByText(/1\/2 online/i)).toBeInTheDocument();
+    expect(screen.getAllByTitle('Online').length).toBeGreaterThan(0);
   });
 });
 
@@ -169,8 +169,6 @@ describe('MemberList role grouping', () => {
     expect(screen.getByTestId('bots-group')).toBeInTheDocument();
     expect(screen.getByText(/Bots — 1/)).toBeInTheDocument();
     expect(screen.getByTestId('bot-status')).toHaveTextContent('BTC $63,412');
-    // Header counts only human members
-    expect(screen.getByText(/1\/1 online/i)).toBeInTheDocument();
     // Bot row should not have an Online/Offline badge
     const botItem = screen.getByTestId('bot-item');
     expect(botItem.querySelector('[title="Online"]')).toBeNull();

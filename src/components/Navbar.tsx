@@ -3,7 +3,8 @@
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useAuthStore } from '@/store/auth';
+import { nip19 } from 'nostr-tools';
+import { getBridge, useIsLoggedIn, useMyPubkey, useUserMetadata } from '@/lib/nostr-bridge';
 import { useTranslation } from '@/i18n/context';
 import ObeliskIcon from './ObeliskIcon';
 import LanguageToggle from './LanguageToggle';
@@ -22,16 +23,14 @@ const GUIDE_ITEMS = [
   { slug: 'future-nostr-relays', tKey: 'learn.card.futureNostrRelays.title' },
 ] as const;
 
-export default function Navbar({ onLoginSuccess }: { onLoginSuccess?: () => void } = {}) {
-  const [showLogin, setShowLogin] = useState(false);
+export default function Navbar(_props: { onLoginSuccess?: () => void } = {}) {
   const [showMenu, setShowMenu] = useState(false);
   const [scrolled, setScrolled] = useState(false);
   const [guidesOpen, setGuidesOpen] = useState(false);
-  const isConnected = useAuthStore((s) => s.isConnected);
-  const profile = useAuthStore((s) => s.profile);
-  const isSyncing = useAuthStore((s) => s.isSyncing);
-  const _hasHydrated = useAuthStore((s) => s._hasHydrated);
-  const { logout, syncProfile, restoreSession } = useAuthStore();
+  const isConnected = useIsLoggedIn();
+  const myPubkey = useMyPubkey();
+  const profile = useUserMetadata(myPubkey);
+  const npub = myPubkey ? safeNpub(myPubkey) : '';
   const { t, locale } = useTranslation();
   const router = useRouter();
 
@@ -41,11 +40,12 @@ export default function Navbar({ onLoginSuccess }: { onLoginSuccess?: () => void
     return () => window.removeEventListener('scroll', onScroll);
   }, []);
 
-  useEffect(() => {
-    if (!_hasHydrated) return;
-    if (isConnected) return;
-    void restoreSession();
-  }, [_hasHydrated, isConnected, restoreSession]);
+  const handleLogout = async () => {
+    const bridge = await getBridge();
+    await bridge.logout();
+    setShowMenu(false);
+    router.push('/');
+  };
 
   return (
     <>
@@ -144,7 +144,7 @@ export default function Navbar({ onLoginSuccess }: { onLoginSuccess?: () => void
                   onClick={() => setShowMenu(!showMenu)}
                   className="flex items-center gap-2.5 py-1.5 pl-1.5 pr-4 bg-lc-dark hover:bg-lc-border rounded-full transition-all duration-200 border border-lc-border/50"
                 >
-                  {profile.picture ? (
+                  {profile?.picture ? (
                     <img
                       src={profile.picture}
                       alt={profile.name || 'Profile'}
@@ -152,11 +152,11 @@ export default function Navbar({ onLoginSuccess }: { onLoginSuccess?: () => void
                     />
                   ) : (
                     <div className="w-8 h-8 rounded-full bg-lc-olive flex items-center justify-center text-lc-green text-sm font-semibold">
-                      {(profile.name || profile.displayName || 'N')[0].toUpperCase()}
+                      {((profile?.name ?? profile?.displayName ?? 'N')[0] ?? 'N').toUpperCase()}
                     </div>
                   )}
                   <span className="text-sm text-lc-white font-medium max-w-[120px] truncate">
-                    {profile.displayName || profile.name || 'Anon'}
+                    {profile?.displayName || profile?.name || 'Anon'}
                   </span>
                 </button>
 
@@ -166,10 +166,10 @@ export default function Navbar({ onLoginSuccess }: { onLoginSuccess?: () => void
                     <div className="absolute right-0 mt-2 w-56 bg-lc-dark border border-lc-border rounded-xl shadow-2xl overflow-hidden z-50">
                       <div className="p-4 border-b border-lc-border">
                         <div className="text-sm text-lc-white font-semibold truncate">
-                          {profile.displayName || profile.name}
+                          {profile?.displayName || profile?.name || 'Anon'}
                         </div>
                         <div className="text-xs text-lc-muted truncate mt-0.5 font-mono">
-                          {profile.npub.slice(0, 20)}...
+                          {npub ? `${npub.slice(0, 20)}...` : ''}
                         </div>
                       </div>
                       <a
@@ -184,23 +184,7 @@ export default function Navbar({ onLoginSuccess }: { onLoginSuccess?: () => void
                         Profile
                       </a>
                       <button
-                        onClick={() => { syncProfile(); }}
-                        disabled={isSyncing}
-                        className="w-full p-3 text-left text-sm text-lc-muted hover:bg-lc-border/50 hover:text-lc-white transition flex items-center gap-2 disabled:opacity-50"
-                      >
-                        {isSyncing ? (
-                          <div className="lc-spinner w-4 h-4" />
-                        ) : (
-                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                            <polyline points="23 4 23 10 17 10"/>
-                            <polyline points="1 20 1 14 7 14"/>
-                            <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/>
-                          </svg>
-                        )}
-                        {isSyncing ? 'Syncing...' : 'Sync Profile'}
-                      </button>
-                      <button
-                        onClick={() => { logout(); setShowMenu(false); router.push('/'); }}
+                        onClick={() => void handleLogout()}
                         className="w-full p-3 text-left text-sm text-red-400 hover:bg-lc-border/50 transition flex items-center gap-2"
                       >
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -229,4 +213,8 @@ export default function Navbar({ onLoginSuccess }: { onLoginSuccess?: () => void
       {/* LoginModal removed: the bridge-backed login lives at /app. Old modal called dead /api/auth/challenge. */}
     </>
   );
+}
+
+function safeNpub(pubkeyHex: string): string {
+  try { return nip19.npubEncode(pubkeyHex); } catch { return ''; }
 }

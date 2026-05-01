@@ -1,0 +1,120 @@
+/**
+ * Tests for the bridge's stale-while-revalidate cache module.
+ *
+ * Uses jsdom's localStorage; resets between tests so individual cases
+ * are independent. The fixture relay URL contains `:` and `/` to verify
+ * the cache key format tolerates them without encoding.
+ */
+import { describe, it, expect, beforeEach } from 'vitest';
+import { cacheGet, cacheSet, cacheDelete, cacheClearAll, cacheListIds } from './cache';
+
+const RELAY = 'wss://relay.example.com';
+const KIND = 39001;
+
+beforeEach(() => {
+  if (typeof window !== 'undefined') window.localStorage.clear();
+});
+
+describe('cache', () => {
+  it('round-trips a value through set/get', () => {
+    cacheSet(RELAY, KIND, 'group-1', ['pk-a', 'pk-b']);
+    const entry = cacheGet<string[]>(RELAY, KIND, 'group-1');
+    expect(entry).not.toBeNull();
+    expect(entry!.value).toEqual(['pk-a', 'pk-b']);
+    expect(entry!.relay).toBe(RELAY);
+    expect(entry!.kind).toBe(KIND);
+    expect(entry!.id).toBe('group-1');
+    expect(typeof entry!.createdAt).toBe('number');
+  });
+
+  it('returns null for a missing key', () => {
+    expect(cacheGet(RELAY, KIND, 'never-stored')).toBeNull();
+  });
+
+  it('returns null on corrupt JSON without throwing', () => {
+    window.localStorage.setItem(`obelisk-cache/${RELAY}/${KIND}/garbage`, '{not json');
+    expect(cacheGet(RELAY, KIND, 'garbage')).toBeNull();
+  });
+
+  it('returns null on non-cache-shaped JSON', () => {
+    window.localStorage.setItem(`obelisk-cache/${RELAY}/${KIND}/wrongshape`, JSON.stringify({ foo: 'bar' }));
+    expect(cacheGet(RELAY, KIND, 'wrongshape')).toBeNull();
+  });
+
+  it('overwrites on a second set', () => {
+    cacheSet(RELAY, KIND, 'group-1', ['old']);
+    cacheSet(RELAY, KIND, 'group-1', ['new', 'list']);
+    expect(cacheGet<string[]>(RELAY, KIND, 'group-1')!.value).toEqual(['new', 'list']);
+  });
+
+  it('isolates by relay — same kind/id on different relays do not collide', () => {
+    cacheSet('wss://a.example', KIND, 'g', ['from-a']);
+    cacheSet('wss://b.example', KIND, 'g', ['from-b']);
+    expect(cacheGet<string[]>('wss://a.example', KIND, 'g')!.value).toEqual(['from-a']);
+    expect(cacheGet<string[]>('wss://b.example', KIND, 'g')!.value).toEqual(['from-b']);
+  });
+
+  it('isolates by kind — same relay/id on different kinds do not collide', () => {
+    cacheSet(RELAY, 39001, 'g', ['admins']);
+    cacheSet(RELAY, 39002, 'g', ['members']);
+    expect(cacheGet<string[]>(RELAY, 39001, 'g')!.value).toEqual(['admins']);
+    expect(cacheGet<string[]>(RELAY, 39002, 'g')!.value).toEqual(['members']);
+  });
+
+  it('cacheDelete with all three args removes only that entry', () => {
+    cacheSet(RELAY, KIND, 'a', ['list-a']);
+    cacheSet(RELAY, KIND, 'b', ['list-b']);
+    cacheDelete(RELAY, KIND, 'a');
+    expect(cacheGet(RELAY, KIND, 'a')).toBeNull();
+    expect(cacheGet<string[]>(RELAY, KIND, 'b')).not.toBeNull();
+  });
+
+  it('cacheDelete with relay+kind wipes all ids for that combo', () => {
+    cacheSet(RELAY, 39001, 'g1', ['x']);
+    cacheSet(RELAY, 39001, 'g2', ['y']);
+    cacheSet(RELAY, 39002, 'g1', ['z']);
+    cacheDelete(RELAY, 39001);
+    expect(cacheGet(RELAY, 39001, 'g1')).toBeNull();
+    expect(cacheGet(RELAY, 39001, 'g2')).toBeNull();
+    expect(cacheGet<string[]>(RELAY, 39002, 'g1')).not.toBeNull();
+  });
+
+  it('cacheDelete with only relay wipes all kinds for that relay', () => {
+    cacheSet(RELAY, 39001, 'g', ['x']);
+    cacheSet(RELAY, 39002, 'g', ['y']);
+    cacheSet('wss://other.example', 39001, 'g', ['keep-me']);
+    cacheDelete(RELAY);
+    expect(cacheGet(RELAY, 39001, 'g')).toBeNull();
+    expect(cacheGet(RELAY, 39002, 'g')).toBeNull();
+    expect(cacheGet<string[]>('wss://other.example', 39001, 'g')).not.toBeNull();
+  });
+
+  it('cacheClearAll wipes every cache entry but leaves unrelated localStorage alone', () => {
+    cacheSet(RELAY, KIND, 'g', ['x']);
+    cacheSet('wss://other.example', 39002, 'h', ['y']);
+    window.localStorage.setItem('unrelated-key', 'preserve');
+    cacheClearAll();
+    expect(cacheGet(RELAY, KIND, 'g')).toBeNull();
+    expect(cacheGet('wss://other.example', 39002, 'h')).toBeNull();
+    expect(window.localStorage.getItem('unrelated-key')).toBe('preserve');
+  });
+
+  it('cacheListIds enumerates ids for a relay+kind', () => {
+    cacheSet(RELAY, KIND, 'g1', ['a']);
+    cacheSet(RELAY, KIND, 'g2', ['b']);
+    cacheSet(RELAY, 39002, 'g3', ['c']);
+    const ids = cacheListIds(RELAY, KIND).sort();
+    expect(ids).toEqual(['g1', 'g2']);
+  });
+
+  it('cacheListIds returns [] for an unseen relay+kind', () => {
+    expect(cacheListIds('wss://nope.example', 12345)).toEqual([]);
+  });
+
+  it('survives groupId values containing colons and dots', () => {
+    const groupId = 'group:weird.id-1';
+    cacheSet(RELAY, KIND, groupId, ['pk']);
+    expect(cacheGet<string[]>(RELAY, KIND, groupId)!.value).toEqual(['pk']);
+    expect(cacheListIds(RELAY, KIND)).toContain(groupId);
+  });
+});

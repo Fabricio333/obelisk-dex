@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { parseBolt11, type ParsedInvoice } from '@/lib/bolt11';
 import { useChatStore } from '@/store/chat';
-import { useAuthStore } from '@/store/auth';
+import { useMyPubkey, useSignerReady } from '@/lib/nostr-bridge';
 import { formatPubkey, getNDK } from '@/lib/nostr';
 import { useLocalWallet } from '@/lib/wallet/local-client';
 import { toKEKSigner } from '@/lib/signer-adapters';
@@ -21,12 +21,21 @@ interface PaidState {
 
 /**
  * Renders a public BOLT11 invoice posted in chat as a payable card.
- * Any channel member with an NWC wallet can click Pay; the first winner
- * flips the card to "Paid" for everyone via the `invoice-paid` socket event.
+ * Any channel member with an NWC wallet can click Pay; the local NWC
+ * payment flow runs entirely client-side.
+ *
+ * TODO(decentralized-invoice-tracking): the previous /api/invoices/* server
+ * orchestrated race protection and broadcast paid-state across clients via
+ * Socket.io. With the relays-only architecture we no longer have a server
+ * to coordinate. The replacement is to publish a kind:9735-style
+ * "invoice paid" Nostr event in the channel; other clients listen and
+ * flip their own local paid state. Until that lands, paid state is
+ * device-local only — refreshing or opening the channel from a different
+ * device will not show "Paid" for invoices another user paid.
  */
-export default function InvoiceCard({ invoice, messageId, channelId }: Props) {
-  const myPubkey = useAuthStore((s) => s.profile?.pubkey ?? null);
-  const signerReady = useAuthStore((s) => s.signerReady);
+export default function InvoiceCard({ invoice, messageId: _messageId, channelId }: Props) {
+  const myPubkey = useMyPubkey();
+  const signerReady = useSignerReady();
   const memberList = useChatStore((s) => s.memberList);
   const pushEphemeral = useChatStore((s) => s.pushEphemeral);
   const invoicePayments = useChatStore((s) => s.invoicePayments);
@@ -48,22 +57,6 @@ export default function InvoiceCard({ invoice, messageId, channelId }: Props) {
     if (hit) setPaid({ payerPubkey: hit.payerPubkey, paidAt: hit.paidAt });
   }, [parsed, invoicePayments]);
 
-  // Lazy status fetch on mount (in case socket event was missed or this
-  // invoice was paid before the client connected).
-  useEffect(() => {
-    if (!parsed || paid) return;
-    let cancelled = false;
-    fetch(`/api/invoices/status?hashes=${parsed.paymentHash}`)
-      .then((r) => r.json())
-      .then((d) => {
-        if (cancelled) return;
-        const hit = (d.paid as Array<{ paymentHash: string; payerPubkey: string; paidAt: string }> | undefined)?.[0];
-        if (hit) setPaid({ payerPubkey: hit.payerPubkey, paidAt: hit.paidAt });
-      })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [parsed, paid]);
-
   if (!parsed) {
     return (
       <span className="block mt-1 px-3 py-2 rounded-lg border border-lc-border text-xs text-lc-muted">
@@ -83,54 +76,19 @@ export default function InvoiceCard({ invoice, messageId, channelId }: Props) {
     }
     setBusy(true);
     try {
-      // Step 1: claim the invoice on the server (race protection).
-      const claimRes = await fetch('/api/invoices/pay/claim', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ invoice, messageId, channelId }),
-      });
-      if (!claimRes.ok) {
-        const d = await claimRes.json().catch(() => ({}));
-        const code = d.error as string | undefined;
-        if (channelId) {
-          const msg =
-            code === 'already_paid' ? '✅ Esta factura ya fue pagada.'
-            : code === 'pending' ? '⏳ Otro usuario está pagando esta factura.'
-            : code === 'expired' ? '⚠️ Esta factura ya expiró.'
-            : `⚠️ No se pudo iniciar el pago (${code || claimRes.status}).`;
-          pushEphemeral(channelId, msg);
-        }
-        return;
-      }
-      const claimBody = await claimRes.json();
-      const paymentHash: string | undefined = claimBody?.paymentHash;
-
-      // Step 2: pay client-side via local NWC.
-      let preimage: string | undefined;
       let paySucceeded = false;
       try {
-        const result = await (_walletClient as unknown as { payInvoice: (a: { invoice: string }) => Promise<{ preimage?: string }> })
+        await (_walletClient as unknown as { payInvoice: (a: { invoice: string }) => Promise<{ preimage?: string }> })
           .payInvoice({ invoice });
-        preimage = result?.preimage;
         paySucceeded = true;
       } catch (e) {
         if (channelId) pushEphemeral(channelId, `⚠️ El pago falló (${(e as Error).message}).`);
       }
 
-      // Step 3: report outcome to server.
-      if (paymentHash) {
-        try {
-          await fetch('/api/invoices/pay/confirm', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              paymentHash,
-              status: paySucceeded ? 'paid' : 'failed',
-              preimage,
-            }),
-          });
-        } catch { /* server will sweep stale pending after 30s */ }
-      }
-
       if (paySucceeded) {
+        // Local-only paid state. See TODO at the top of the file for the
+        // relay-published-event replacement that will broadcast paid status
+        // to other clients.
         setPaid({
           payerPubkey: myPubkey || '?',
           paidAt: new Date().toISOString(),

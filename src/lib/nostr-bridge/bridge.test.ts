@@ -32,10 +32,13 @@ const fake = vi.hoisted(() => {
   }
 
   class FakePool {
-    subscribe(_relays: string[], filter: Record<string, unknown>, opts: { onevent: (ev: any) => void }) {
+    subscribe(_relays: string[], filter: Record<string, unknown>, opts: { onevent: (ev: any) => void; oneose?: () => void; onauth?: unknown }) {
       const sub = { filter, sink: opts.onevent };
       state.subscriptions.push(sub);
       for (const ev of state.published) if (matchesInternal(filter, ev as any)) opts.onevent(ev);
+      // Fire EOSE so subscribeWatched's watchdog marks the sub as alive and
+      // doesn't queue retries during tests.
+      queueMicrotask(() => opts.oneose?.());
       return { close: () => { state.subscriptions = state.subscriptions.filter((s) => s !== sub); } };
     }
     publish(_relays: string[], event: any): Promise<string>[] {
@@ -47,6 +50,15 @@ const fake = vi.hoisted(() => {
     }
     close(_relays: string[]): void {
       state.subscriptions = [];
+    }
+    /**
+     * The bridge's `connect()` awaits `pool.ensureRelay(url, ...)` before
+     * issuing REQs (post Fix A: login no longer flips `isLoggedIn` until
+     * connect resolves). The fake returns `connected: true` instantly so
+     * tests pretend every relay is reachable.
+     */
+    async ensureRelay(_url: string, _opts?: { connectionTimeout?: number }): Promise<{ connected: boolean; onclose?: () => void }> {
+      return { connected: true };
     }
   }
 

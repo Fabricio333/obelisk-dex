@@ -2,32 +2,32 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const mockPublishProfile = vi.fn().mockResolvedValue({ id: 'evt-1' });
-const mockFetchCurrentKind0 = vi.fn().mockResolvedValue({});
-const mockGetNDK = vi.fn(() => ({ signer: { user: vi.fn().mockResolvedValue({ pubkey: 'abc123' }) } }));
+const mockEditUserMetadata = vi.fn().mockResolvedValue(undefined);
+const mockGetBridge = vi.fn().mockResolvedValue({
+  editUserMetadata: (...args: unknown[]) => mockEditUserMetadata(...args),
+});
 const mockUploadToBlossom = vi.fn().mockResolvedValue('https://blossom.primal.net/abc123.jpg');
 
-vi.mock('@/lib/nostr', () => ({
-  publishProfile: (...args: unknown[]) => mockPublishProfile(...args),
-  fetchCurrentKind0: (...args: unknown[]) => mockFetchCurrentKind0(...args),
-  getNDK: () => mockGetNDK(),
+let mockProfile: {
+  pubkey: string;
+  name: string | null;
+  displayName: string | null;
+  picture: string | null;
+  about: string | null;
+  nip05: string | null;
+  banner: string | null;
+  lud16: string | null;
+  website: string | null;
+} | null = null;
+
+vi.mock('@/lib/nostr-bridge', () => ({
+  getBridge: () => mockGetBridge(),
+  useMyPubkey: () => 'abc123',
+  useUserMetadata: () => mockProfile,
 }));
 
 vi.mock('@/lib/blossom', () => ({
   uploadToBlossom: (...args: unknown[]) => mockUploadToBlossom(...args),
-}));
-
-const mockSyncProfile = vi.fn().mockResolvedValue(undefined);
-
-const mockAuthState = {
-  profile: { pubkey: 'abc123', npub: 'npub1abc', name: 'Test', displayName: 'Test', picture: null },
-  syncProfile: mockSyncProfile,
-};
-
-vi.mock('@/store/auth', () => ({
-  useAuthStore: vi.fn((selector?: (s: typeof mockAuthState) => unknown) =>
-    typeof selector === 'function' ? selector(mockAuthState) : mockAuthState
-  ),
 }));
 
 vi.mock('@/i18n/context', () => ({
@@ -42,7 +42,7 @@ describe('ProfileEditor', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    mockFetchCurrentKind0.mockResolvedValue({});
+    mockProfile = null;
   });
 
   describe('setup mode', () => {
@@ -70,21 +70,20 @@ describe('ProfileEditor', () => {
       expect(publishBtn).toBeDisabled();
     });
 
-    it('publishes profile with name and calls onComplete', async () => {
+    it('publishes profile via bridge.editUserMetadata and calls onComplete', async () => {
       render(<ProfileEditor mode="setup" onComplete={mockOnComplete} onSkip={mockOnSkip} />);
 
       await userEvent.type(screen.getByPlaceholderText('profileEditor.namePlaceholder'), 'Alice');
       await userEvent.click(screen.getByText('profileEditor.publish'));
 
       await waitFor(() => {
-        expect(mockPublishProfile).toHaveBeenCalledWith({
+        expect(mockEditUserMetadata).toHaveBeenCalledWith({
           name: 'Alice',
-          display_name: 'Alice',
+          displayName: 'Alice',
         });
       });
 
       await waitFor(() => {
-        expect(mockSyncProfile).toHaveBeenCalled();
         expect(mockOnComplete).toHaveBeenCalled();
       });
     });
@@ -107,9 +106,9 @@ describe('ProfileEditor', () => {
       });
 
       await waitFor(() => {
-        expect(mockPublishProfile).toHaveBeenCalledWith({
+        expect(mockEditUserMetadata).toHaveBeenCalledWith({
           name: 'Alice',
-          display_name: 'Alice',
+          displayName: 'Alice',
           picture: 'https://blossom.primal.net/abc123.jpg',
         });
       });
@@ -117,15 +116,18 @@ describe('ProfileEditor', () => {
   });
 
   describe('edit mode', () => {
-    it('pre-fills from kind 0 data', async () => {
-      mockFetchCurrentKind0.mockResolvedValue({
+    it('pre-fills from cached kind:0 data', async () => {
+      mockProfile = {
+        pubkey: 'abc123',
         name: 'OldName',
-        display_name: 'OldName',
+        displayName: 'OldName',
         picture: 'https://example.com/old.jpg',
         about: 'Old bio',
         nip05: 'user@example.com',
+        banner: null,
         lud16: 'user@walletofsatoshi.com',
-      });
+        website: null,
+      };
 
       render(<ProfileEditor mode="edit" onComplete={mockOnComplete} />);
 
@@ -136,6 +138,17 @@ describe('ProfileEditor', () => {
     });
 
     it('renders edit title and cancel button', async () => {
+      mockProfile = {
+        pubkey: 'abc123',
+        name: 'X',
+        displayName: 'X',
+        picture: null,
+        about: null,
+        nip05: null,
+        banner: null,
+        lud16: null,
+        website: null,
+      };
       render(<ProfileEditor mode="edit" onComplete={mockOnComplete} />);
 
       await waitFor(() => {
@@ -145,12 +158,17 @@ describe('ProfileEditor', () => {
     });
 
     it('shows confirmation before publishing in edit mode', async () => {
-      mockFetchCurrentKind0.mockResolvedValue({
+      mockProfile = {
+        pubkey: 'abc123',
         name: 'OldName',
-        display_name: 'OldName',
-        about: '',
+        displayName: 'OldName',
+        picture: null,
+        about: null,
         nip05: 'keep@me.com',
-      });
+        banner: null,
+        lud16: null,
+        website: null,
+      };
 
       render(<ProfileEditor mode="edit" onComplete={mockOnComplete} />);
 
@@ -168,6 +186,17 @@ describe('ProfileEditor', () => {
     });
 
     it('calls onComplete when cancel is clicked', async () => {
+      mockProfile = {
+        pubkey: 'abc123',
+        name: 'X',
+        displayName: 'X',
+        picture: null,
+        about: null,
+        nip05: null,
+        banner: null,
+        lud16: null,
+        website: null,
+      };
       render(<ProfileEditor mode="edit" onComplete={mockOnComplete} />);
 
       await waitFor(() => {
@@ -181,7 +210,7 @@ describe('ProfileEditor', () => {
 
   describe('error handling', () => {
     it('shows error when publish fails', async () => {
-      mockPublishProfile.mockRejectedValueOnce(new Error('Network error'));
+      mockEditUserMetadata.mockRejectedValueOnce(new Error('Network error'));
 
       render(<ProfileEditor mode="setup" onComplete={mockOnComplete} onSkip={mockOnSkip} />);
 

@@ -4,14 +4,14 @@ import { getTranslation, countryToLocale, LATAM_COUNTRIES, DEFAULT_LOCALE } from
 describe('getTranslation', () => {
   it('returns English strings for "en" locale', () => {
     const t = getTranslation('en');
-    expect(t('hero.title')).toBe('The Discord alternative with');
-    expect(t('hero.titleHighlight')).toBe('Nostr login');
+    expect(t('hero.title')).toBe('Discord-style group chat,');
+    expect(t('hero.titleHighlight')).toBe('pure Nostr');
   });
 
   it('returns Spanish strings for "es" locale', () => {
     const t = getTranslation('es');
-    expect(t('hero.title')).toBe('La alternativa a Discord con');
-    expect(t('hero.titleHighlight')).toBe('login Nostr');
+    expect(t('hero.title')).toBe('Chat grupal estilo Discord,');
+    expect(t('hero.titleHighlight')).toBe('puro Nostr');
   });
 
   it('returns the key itself for missing translations', () => {
@@ -21,7 +21,7 @@ describe('getTranslation', () => {
 
   it('defaults to Spanish for unknown locale', () => {
     const t = getTranslation('fr' as any);
-    expect(t('hero.title')).toBe('La alternativa a Discord con');
+    expect(t('hero.title')).toBe('Chat grupal estilo Discord,');
   });
 });
 

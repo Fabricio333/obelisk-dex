@@ -1,0 +1,176 @@
+/**
+ * Tiny stale-while-revalidate cache for relay-derived state.
+ *
+ * Why this exists: the bridge re-fetches everything from the relay on every
+ * page load. For data that's small and rarely-changing (admin/member lists,
+ * profile metadata, channel layout, relay branding), the round-trip is
+ * latency the user feels — even after the login-race fix lands. Painting
+ * stale-but-correct values from disk while the relay re-confirms makes the
+ * sidebar appear instantly on reload.
+ *
+ * Contract:
+ *   - Stale-while-revalidate. Callers `cacheGet` for instant paint, then
+ *     let the live relay subscription overwrite the in-memory store via the
+ *     usual `StateStore.update` path. There is no TTL — relays are the
+ *     source of truth and arriving events monotonically replace the cache
+ *     via `cacheSet`.
+ *   - Keyed by `relay + kind + id`. The relay scoping prevents cross-relay
+ *     leakage (a server's admin list is meaningful only for that relay).
+ *   - localStorage-backed. Synchronous, ~5MB cap per origin. v1 only stores
+ *     small lists (39001/39002 = N pubkeys per group, kind 0 ~1KB per user).
+ *     Messages are NOT cached here — they would blow the cap.
+ *   - Invalidation: explicit only. {@link cacheClearAll} on logout.
+ *     {@link cacheDelete} for surgical removal. We deliberately do NOT
+ *     invalidate on relay-switch — caches for the previous relay stay on
+ *     disk and re-paint instantly if the user switches back.
+ *
+ * Currently wired:
+ *   - kind 39001 / 39002 (admin/member lists)  — see `client.ts` ingestAdminMember
+ *
+ * TODO (extend later, foundation is here):
+ *   - kind 39000   (group metadata)
+ *   - kind 0       (user profile metadata)
+ *   - kind 30078   (channel layout, NIP-78)
+ *   - relay branding events
+ */
+
+const KEY_PREFIX = 'obelisk-cache/';
+
+export interface CachedEntry<T> {
+  readonly value: T;
+  readonly createdAt: number;
+  readonly relay: string;
+  readonly kind: number;
+  readonly id: string;
+}
+
+interface Storable<T> {
+  v: T;
+  /** Wall-clock ms when cacheSet was called. Used for telemetry only. */
+  t: number;
+}
+
+function buildKey(relay: string, kind: number, id: string): string {
+  // The relay URL can contain `:` and `/` which are fine in localStorage keys.
+  // We don't encode them — collisions across relays already require identical
+  // protocol+host+path which would be the same relay anyway.
+  return `${KEY_PREFIX}${relay}/${kind}/${id}`;
+}
+
+function isAvailable(): boolean {
+  return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
+}
+
+/**
+ * Read a cached entry. Returns `null` when:
+ *   - localStorage is unavailable (SSR)
+ *   - the key was never written
+ *   - the stored payload failed to parse (corruption — silently dropped)
+ */
+export function cacheGet<T>(relay: string, kind: number, id: string): CachedEntry<T> | null {
+  if (!isAvailable()) return null;
+  try {
+    const raw = window.localStorage.getItem(buildKey(relay, kind, id));
+    if (raw === null) return null;
+    const parsed = JSON.parse(raw) as Storable<T>;
+    if (typeof parsed !== 'object' || parsed === null || !('v' in parsed) || !('t' in parsed)) {
+      return null;
+    }
+    return {
+      value: parsed.v,
+      createdAt: parsed.t,
+      relay,
+      kind,
+      id,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Write a cached entry. Quietly no-ops if localStorage throws (quota, private
+ * browsing, etc.) — the live store is still authoritative; cache is a UX
+ * optimization, not durability.
+ */
+export function cacheSet<T>(relay: string, kind: number, id: string, value: T): void {
+  if (!isAvailable()) return;
+  const payload: Storable<T> = { v: value, t: Date.now() };
+  try {
+    window.localStorage.setItem(buildKey(relay, kind, id), JSON.stringify(payload));
+  } catch {
+    // Quota exceeded, private mode, etc. — degrade silently.
+  }
+}
+
+/**
+ * Delete one or more entries. Calling shapes:
+ *   - `cacheDelete(relay, kind, id)`     → single entry
+ *   - `cacheDelete(relay, kind)`         → wipe all ids for that relay+kind
+ *   - `cacheDelete(relay)`               → wipe all entries for that relay
+ */
+export function cacheDelete(relay: string, kind?: number, id?: string): void {
+  if (!isAvailable()) return;
+  if (kind !== undefined && id !== undefined) {
+    try { window.localStorage.removeItem(buildKey(relay, kind, id)); } catch { /* ignore */ }
+    return;
+  }
+  // Prefix wipe: enumerate keys and remove matches.
+  const prefix = kind !== undefined
+    ? `${KEY_PREFIX}${relay}/${kind}/`
+    : `${KEY_PREFIX}${relay}/`;
+  try {
+    const toRemove: string[] = [];
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const key = window.localStorage.key(i);
+      if (key && key.startsWith(prefix)) toRemove.push(key);
+    }
+    toRemove.forEach((k) => window.localStorage.removeItem(k));
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Wipe every cache entry (any relay, any kind). Used on logout — leaving
+ * cached data on disk after a session ends would let the next user briefly
+ * see the previous identity's admin/member lists.
+ */
+export function cacheClearAll(): void {
+  if (!isAvailable()) return;
+  try {
+    const toRemove: string[] = [];
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const key = window.localStorage.key(i);
+      if (key && key.startsWith(KEY_PREFIX)) toRemove.push(key);
+    }
+    toRemove.forEach((k) => window.localStorage.removeItem(k));
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Enumerate cached ids for a relay+kind. Used during bridge construction to
+ * seed in-memory stores without knowing the id list ahead of time.
+ *
+ * Returns ids only — callers `cacheGet` each one to pull the value. This
+ * keeps the function cheap to scan (no JSON.parse) and avoids a giant
+ * payload in memory all at once.
+ */
+export function cacheListIds(relay: string, kind: number): string[] {
+  if (!isAvailable()) return [];
+  const prefix = `${KEY_PREFIX}${relay}/${kind}/`;
+  const ids: string[] = [];
+  try {
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const key = window.localStorage.key(i);
+      if (key && key.startsWith(prefix)) {
+        ids.push(key.slice(prefix.length));
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return ids;
+}
