@@ -330,6 +330,11 @@ class BridgeImpl implements NostrBridge {
   // revision from a slow relay can't overwrite a fresher one. Also lets
   // the cached seed survive against stale events still in flight.
   private groupMetadataLatestAt = new Map<string, number>();
+  // Newest-wins guard for kind 0 (user metadata). Without this, an older
+  // revision returned by a slow profile relay overwrites a newer one from a
+  // faster relay — the symptom is the member rail's names/avatars loading
+  // and then "unloading" back to the npub a moment later.
+  private userMetadataLatestAt = new Map<string, number>();
   /**
    * After {@link resetPoolForSessionChange} rebuilds the pool, the global
    * subscriptions get re-issued by {@link connect}, but per-group REQs
@@ -1925,6 +1930,8 @@ class BridgeImpl implements NostrBridge {
   }
 
   private ingestUserMetadata(ev: NostrEvent): void {
+    const prevAt = this.userMetadataLatestAt.get(ev.pubkey) ?? 0;
+    if (ev.created_at <= prevAt) return;
     try {
       const data = JSON.parse(ev.content) as Record<string, unknown>;
       const meta: JsUserMetadata = {
@@ -1939,6 +1946,7 @@ class BridgeImpl implements NostrBridge {
         website: (data.website as string) ?? null,
       };
       this.userMetadata.update((prev) => ({ ...prev, [ev.pubkey]: meta }));
+      this.userMetadataLatestAt.set(ev.pubkey, ev.created_at);
     } catch {
       // ignore malformed kind:0 content
     }
@@ -2063,9 +2071,33 @@ class BridgeImpl implements NostrBridge {
       const state = parseRelayRejection(reason);
       if (state) this.setRelayAccess(targetRelays[i], state);
     });
-    const accepted = results.filter((r) => r.status === 'fulfilled');
+    let accepted = results.filter((r) => r.status === 'fulfilled');
+    let finalResults = results;
+    // First publish after a relay switch often times out because NIP-42 AUTH
+    // hasn't completed yet — the AUTH challenge fires in parallel with the
+    // EVENT and the publish promise loses the race. By the time the user
+    // sees the timeout the socket is authed, so a single retry succeeds and
+    // the user doesn't have to manually click Create again.
+    const allTimedOut =
+      accepted.length === 0 &&
+      results.every((r) => {
+        if (r.status === 'fulfilled') return false;
+        const reason = (r.reason instanceof Error ? r.reason.message : String(r.reason)).toLowerCase();
+        return reason.includes('time') && reason.includes('out');
+      });
+    if (allTimedOut) {
+      const retry = this.pool.publish(targetRelays, event, { onauth: this.getAuthSigner() });
+      finalResults = await Promise.allSettled(retry);
+      finalResults.forEach((r, i) => {
+        if (r.status !== 'rejected') return;
+        const reason = r.reason instanceof Error ? r.reason.message : String(r.reason);
+        const state = parseRelayRejection(reason);
+        if (state) this.setRelayAccess(targetRelays[i], state);
+      });
+      accepted = finalResults.filter((r) => r.status === 'fulfilled');
+    }
     if (accepted.length === 0) {
-      const reasons = results
+      const reasons = finalResults
         .map((r, i) => {
           if (r.status === 'fulfilled') return null;
           const reason = r.reason instanceof Error ? r.reason.message : String(r.reason);

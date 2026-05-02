@@ -627,19 +627,31 @@ function CreateGroupSection({ count, onCreated }: { count: number; onCreated: (g
   const [name, setName] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [blockKind, setBlockKind] = useState<'auth' | 'whitelist' | null>(null);
+  const relay = useCurrentRelayUrl();
+
+  function classifyError(msg: string): 'auth' | 'whitelist' | null {
+    const r = msg.toLowerCase();
+    if (r.includes('auth-required') || r.includes('auth_required') || r.includes('auth required')) return 'auth';
+    if (r.includes('blocked') || r.includes('not whitelisted') || r.includes('whitelist') || r.includes('restricted') || r.includes('not allowed')) return 'whitelist';
+    return null;
+  }
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     if (!name.trim()) return;
     setBusy(true);
     setErr(null);
+    setBlockKind(null);
     try {
       const id = await nostrActions.createGroup({ name: name.trim(), isPublic: true, isOpen: true });
       setName('');
       setOpen(false);
       onCreated(id);
     } catch (e) {
-      setErr((e as Error).message);
+      const msg = (e as Error).message;
+      setErr(msg);
+      setBlockKind(classifyError(msg));
     } finally {
       setBusy(false);
     }
@@ -676,8 +688,43 @@ function CreateGroupSection({ count, onCreated }: { count: number; onCreated: (g
               {busy ? '…' : 'Create'}
             </button>
           </div>
-          {err && <span className="break-words text-[10px] text-red-400">{err}</span>}
+          {err && !blockKind && (
+            <span className="break-words text-xs text-red-400">{err}</span>
+          )}
         </form>
+      )}
+      {blockKind && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+          onClick={() => setBlockKind(null)}
+        >
+          <div
+            className="max-w-md rounded-xl border border-red-500/50 bg-lc-card p-6 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="text-xl font-bold text-red-300">
+              {blockKind === 'auth'
+                ? `Authentication failed on ${shortHost(relay)}`
+                : `Not whitelisted on ${shortHost(relay)}`}
+            </div>
+            <div className="mt-3 text-sm text-lc-white/90">
+              {blockKind === 'auth'
+                ? 'The relay required NIP-42 AUTH and the signing did not complete. Approve the signing request, reload, or switch login methods.'
+                : 'This relay accepted your signature but won’t accept events from your pubkey. Ask the operator to add you to its allowlist, or switch relays.'}
+            </div>
+            <div className="mt-3 break-words rounded bg-lc-black/60 p-2 font-mono text-[11px] text-lc-muted">
+              {err}
+            </div>
+            <div className="mt-4 flex justify-end">
+              <button
+                onClick={() => setBlockKind(null)}
+                className="rounded-lg bg-lc-green px-4 py-1.5 text-sm font-semibold text-lc-black"
+              >
+                Got it
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
