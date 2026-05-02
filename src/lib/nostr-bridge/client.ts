@@ -56,6 +56,13 @@ function normalizeRelayUrl(u: string): string {
  */
 function parseRelayRejection(reason: string): RelayAccessState | null {
   const r = reason.toLowerCase();
+  // Rate-limit messages sometimes ship with the "restricted:" prefix
+  // (e.g. "restricted: connection rate limit exceeded"). They are transient,
+  // not a pubkey-allowlist signal — classifying them as 'restricted' would
+  // wrongly flash "Not whitelisted" to legitimate users.
+  if (r.includes('rate limit') || r.includes('rate-limit') || r.includes('too many') || r.includes('slow down')) {
+    return null;
+  }
   if (r.includes('auth-required') || r.includes('auth_required') || r.includes('auth required')) {
     return 'auth-required';
   }

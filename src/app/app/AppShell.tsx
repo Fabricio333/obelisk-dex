@@ -142,6 +142,7 @@ export default function AppShell() {
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-lc-black text-lc-white">
       <MessageZapModal />
+      <RelayAccessModal />
       <RelayTopBar relay={relay} onOpenSidebar={() => setSidebarOpen(true)} />
       <div className="flex flex-1 overflow-hidden relative">
         {/* Mobile backdrop */}
@@ -639,31 +640,19 @@ function CreateGroupSection({ count, onCreated }: { count: number; onCreated: (g
   const [name, setName] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [blockKind, setBlockKind] = useState<'auth' | 'whitelist' | null>(null);
-  const relay = useCurrentRelayUrl();
-
-  function classifyError(msg: string): 'auth' | 'whitelist' | null {
-    const r = msg.toLowerCase();
-    if (r.includes('auth-required') || r.includes('auth_required') || r.includes('auth required')) return 'auth';
-    if (r.includes('blocked') || r.includes('not whitelisted') || r.includes('whitelist') || r.includes('restricted') || r.includes('not allowed')) return 'whitelist';
-    return null;
-  }
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     if (!name.trim()) return;
     setBusy(true);
     setErr(null);
-    setBlockKind(null);
     try {
       const id = await nostrActions.createGroup({ name: name.trim(), isPublic: true, isOpen: true });
       setName('');
       setOpen(false);
       onCreated(id);
     } catch (e) {
-      const msg = (e as Error).message;
-      setErr(msg);
-      setBlockKind(classifyError(msg));
+      setErr((e as Error).message);
     } finally {
       setBusy(false);
     }
@@ -700,43 +689,8 @@ function CreateGroupSection({ count, onCreated }: { count: number; onCreated: (g
               {busy ? '…' : 'Create'}
             </button>
           </div>
-          {err && !blockKind && (
-            <span className="break-words text-xs text-red-400">{err}</span>
-          )}
+          {err && <span className="break-words text-[10px] text-red-400">{err}</span>}
         </form>
-      )}
-      {blockKind && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
-          onClick={() => setBlockKind(null)}
-        >
-          <div
-            className="max-w-md rounded-xl border border-red-500/50 bg-lc-card p-6 shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="text-xl font-bold text-red-300">
-              {blockKind === 'auth'
-                ? `Authentication failed on ${shortHost(relay)}`
-                : `Not whitelisted on ${shortHost(relay)}`}
-            </div>
-            <div className="mt-3 text-sm text-lc-white/90">
-              {blockKind === 'auth'
-                ? 'The relay required NIP-42 AUTH and the signing did not complete. Approve the signing request, reload, or switch login methods.'
-                : 'This relay accepted your signature but won’t accept events from your pubkey. Ask the operator to add you to its allowlist, or switch relays.'}
-            </div>
-            <div className="mt-3 break-words rounded bg-lc-black/60 p-2 font-mono text-[11px] text-lc-muted">
-              {err}
-            </div>
-            <div className="mt-4 flex justify-end">
-              <button
-                onClick={() => setBlockKind(null)}
-                className="rounded-lg bg-lc-green px-4 py-1.5 text-sm font-semibold text-lc-black"
-              >
-                Got it
-              </button>
-            </div>
-          </div>
-        </div>
       )}
     </div>
   );
@@ -3165,6 +3119,62 @@ function Avatar({ pubkey, size, picture }: { pubkey: string; size: number; pictu
       className="flex items-center justify-center rounded-full font-mono text-[10px] font-bold text-lc-white"
     >
       {pubkey.slice(0, 2).toUpperCase()}
+    </div>
+  );
+}
+
+function RelayAccessModal() {
+  const relay = useCurrentRelayUrl();
+  const access = useRelayAccess();
+  const loginMethod = useMyLoginMethod();
+  const isLoggedIn = useIsLoggedIn();
+  // Track which (relay, state) tuple the user has dismissed so the modal
+  // doesn't keep popping back. A real state change (e.g. ok -> restricted
+  // again on a new relay, or auth-required after restricted) re-arms it.
+  const [dismissed, setDismissed] = useState<string | null>(null);
+  const key = relay && (access === 'restricted' || access === 'auth-required')
+    ? `${relay}|${access}`
+    : null;
+  if (!isLoggedIn) return null;
+  if (!key) return null;
+  if (dismissed === key) return null;
+
+  const host = shortHost(relay);
+  const isAuth = access === 'auth-required';
+  const title = isAuth ? `Not authenticated to ${host}` : `Not whitelisted on ${host}`;
+  const body = isAuth
+    ? loginMethod === 'bunker'
+      ? 'Approve the signing request in your bunker app to complete NIP-42 AUTH.'
+      : loginMethod === 'nip07'
+        ? 'Approve the signing request in your Nostr extension to complete NIP-42 AUTH.'
+        : 'NIP-42 AUTH did not complete. Try reloading or switching login methods.'
+    : 'This relay accepted your signature but won’t serve or accept events from your pubkey. Ask the operator to add you to its allowlist, or switch relays.';
+
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4"
+      onClick={() => setDismissed(key)}
+    >
+      <div
+        className={
+          'max-w-md rounded-xl border bg-lc-card p-6 shadow-2xl ' +
+          (isAuth ? 'border-yellow-500/50' : 'border-red-500/50')
+        }
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className={'text-xl font-bold ' + (isAuth ? 'text-yellow-200' : 'text-red-300')}>
+          {title}
+        </div>
+        <div className="mt-3 text-sm text-lc-white/90">{body}</div>
+        <div className="mt-4 flex justify-end">
+          <button
+            onClick={() => setDismissed(key)}
+            className="rounded-lg bg-lc-green px-4 py-1.5 text-sm font-semibold text-lc-black"
+          >
+            Got it
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
