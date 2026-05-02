@@ -44,6 +44,13 @@ export const nostrActions = {
     (await getBridge()).putUser(groupId, pubkey, roles),
   removeUser: async (groupId: string, pubkey: string) =>
     (await getBridge()).removeUser(groupId, pubkey),
+  removePermission: async (
+    groupId: string,
+    pubkey: string,
+    permissions: ReadonlyArray<string>,
+  ) => (await getBridge()).removePermission(groupId, pubkey, permissions),
+  claimCreatorAdmin: async (groupId: string) =>
+    (await getBridge()).claimCreatorAdmin(groupId),
   deleteGroupEvent: async (groupId: string, eventId: string) =>
     (await getBridge()).deleteGroupEvent(groupId, eventId),
   loadMoreMessages: async (groupId: string) =>
