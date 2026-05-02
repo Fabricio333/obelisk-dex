@@ -92,8 +92,8 @@ export const STORAGE_KEY = 'obelisk-dex/session';
 export const RELAYS_KEY = 'obelisk-dex/relays';
 const LEGACY_STORAGE_KEY = 'obeliskord/session';
 const LEGACY_RELAYS_KEY = 'obeliskord/relays';
-const DEFAULT_RELAY = 'wss://relay.obelisk.ar';
-const DEFAULT_RELAYS = ['wss://relay.obelisk.ar', 'wss://public.obelisk.ar'];
+const DEFAULT_RELAY = 'wss://public.obelisk.ar';
+const DEFAULT_RELAYS = ['wss://public.obelisk.ar'];
 
 /**
  * Read a localStorage value under the current key, falling back to the legacy
@@ -420,9 +420,16 @@ class BridgeImpl implements NostrBridge {
       try {
         await this.connect();
       } catch {
-        // Connect failed (no relays reachable, etc.). Keep the persisted
-        // session in memory so a later switchRelay/retry can use it, but
-        // do NOT flip isLoggedIn — the UI will keep showing LoginModal.
+        // First connect attempt failed (relay unreachable, AUTH timeout,
+        // etc.). Keep the session in memory and silently retry in the
+        // background with capped exponential backoff so the user doesn't
+        // have to refresh. The cached sidebar paint from seedCacheForRelay
+        // is already on screen (admins/members/groups), so the UI doesn't
+        // flash empty — we just keep trying until a relay answers.
+        this.myPubkey.set(parsed.pubKeyHex);
+        this.myLoginMethod.set(parsed.loginMethod);
+        this.isLoggedIn.set(true);
+        void this.reconnectInBackground();
         return;
       }
       this.myPubkey.set(parsed.pubKeyHex);
@@ -806,10 +813,13 @@ class BridgeImpl implements NostrBridge {
           validateRelayUrl(url);
           const relay = await this.pool.ensureRelay(url, { connectionTimeout: 5000 });
           if (!relay.connected) throw new Error(`relay ${url} did not complete handshake`);
-          // Flip status back if the socket drops later.
+          // Flip status back if the socket drops later, and trigger a
+          // silent background reconnect so the user doesn't have to
+          // refresh when the relay or network blips.
           relay.onclose = () => {
-            if (this.relays.includes(url)) {
+            if (this.relays.includes(url) && this.session) {
               this.connectionState.set('Disconnected');
+              this.reconnectInBackground();
             }
           };
           return url;
@@ -839,12 +849,48 @@ class BridgeImpl implements NostrBridge {
         pending.metadata.forEach((pk) => this.ensureUserMetadata(pk));
       }
       this.connectionState.set('Connected');
+      this.reconnectAttempt = 0;
       resolveActivity(activityId, `${connectedCount}/${this.relays.length} relays`);
     } catch (e: unknown) {
       this.connectionState.set(`Error:${(e as Error).message}`);
       failActivity(activityId, (e as Error).message);
       throw e;
     }
+  }
+
+  /**
+   * Retry `connect()` silently in the background with capped exponential
+   * backoff. Used when the initial rehydrate connect fails or a relay socket
+   * drops after login — we keep the chat UI mounted (with cached state from
+   * seedCacheForRelay) and heal the connection without forcing the user to
+   * refresh. Idempotent: a second call while one is already pending is a
+   * no-op.
+   */
+  private reconnectAttempt = 0;
+  private reconnectInFlight = false;
+  private reconnectInBackground(): void {
+    if (this.reconnectInFlight) return;
+    if (!this.session) return;
+    this.reconnectInFlight = true;
+    const tick = async () => {
+      if (!this.session) {
+        this.reconnectInFlight = false;
+        return;
+      }
+      this.reconnectAttempt++;
+      try {
+        // Fresh sockets so a half-open / AUTH-stuck socket doesn't keep
+        // the new attempt from making progress.
+        this.resetPoolForSessionChange();
+        await this.connect();
+        this.reconnectInFlight = false;
+        this.reconnectAttempt = 0;
+      } catch {
+        const delay = Math.min(1000 * 2 ** (this.reconnectAttempt - 1), 30_000);
+        setTimeout(tick, delay);
+      }
+    };
+    void tick();
   }
 
   async switchRelay(url: string): Promise<void> {
@@ -1374,15 +1420,14 @@ class BridgeImpl implements NostrBridge {
    *     a slow NIP-42 round-trip + initial query on a backed-up relay. Lower
    *     this for non-critical paths where a missed retry just means stale
    *     UX for a few seconds.
-   *   - `maxAttempts`: how many times to retry before giving up. 4 with
-   *     exponential backoff (1s/2s/4s/8s) caps total wait at ~27s, which is
-   *     "I'll wait this long before I refuse to declare bankruptcy on this
-   *     subscription". Lower this for non-critical paths.
-   *
-   * Critical paths (group metadata, group messages, admin/member, DMs,
-   * contact list) keep the 5000/4 default — losing them means an empty
-   * UI. Non-critical paths (kind:0 metadata, reactions) override with
-   * tighter values: a missed reaction just delays an emoji badge.
+   *   - `maxAttempts`: how many times to retry before giving up. Defaults
+   *     to `Infinity` for critical paths (group metadata, messages,
+   *     admin/member, DMs, contact list) — losing those means an empty UI
+   *     and the user shouldn't have to refresh to recover. Backoff still
+   *     applies (1s/2s/4s/8s, capped at 30s) so a permanently-broken relay
+   *     doesn't burn CPU. Non-critical paths (kind:0 metadata, reactions)
+   *     override with `maxAttempts: 2` since a missed retry there just
+   *     delays a display-name resolve or an emoji badge.
    */
   private subscribeWatched(
     relays: string[],
@@ -1392,7 +1437,8 @@ class BridgeImpl implements NostrBridge {
     options?: { watchdogMs?: number; maxAttempts?: number },
   ): { close: () => void } {
     const WATCHDOG_MS = options?.watchdogMs ?? 5000;
-    const MAX_ATTEMPTS = options?.maxAttempts ?? 4;
+    const MAX_ATTEMPTS = options?.maxAttempts ?? Infinity;
+    const MAX_BACKOFF_MS = 30_000;
     let attempt = 0;
     let activeSub: { close: () => void } | null = null;
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -1439,7 +1485,7 @@ class BridgeImpl implements NostrBridge {
       try { activeSub?.close(); } catch { /* ignore */ }
       activeSub = null;
       if (attempt < MAX_ATTEMPTS) {
-        const delay = Math.min(1000 * 2 ** (attempt - 1), 8000);
+        const delay = Math.min(1000 * 2 ** (attempt - 1), MAX_BACKOFF_MS);
         timer = setTimeout(start, delay);
       }
     };
