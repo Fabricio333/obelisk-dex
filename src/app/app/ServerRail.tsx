@@ -16,6 +16,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { nostrActions, useConfiguredRelays, useCurrentRelayUrl } from '@/lib/nostr-bridge';
 import { faviconFor, fetchRelayInfo, type RelayInfo } from '@/lib/relay-info';
+import { encodeRelayShareCode } from '@/lib/relay-share-link';
 
 const SUGGESTED_RELAYS: { url: string; fallbackName?: string; fallbackDescription?: string }[] = [
   {
@@ -174,6 +175,19 @@ function RelayTile({
   const [menu, setMenu] = useState(false);
   const [iconUrl, setIconUrl] = useState<string | null>(null);
   const [iconFailed, setIconFailed] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  async function copyShareLink() {
+    const origin = typeof window !== 'undefined' ? window.location.origin : 'https://obelisk.ar';
+    const link = `${origin}/r/${encodeRelayShareCode(url)}`;
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      window.prompt('Copy this link', link);
+    }
+  }
 
   useEffect(() => {
     let alive = true;
@@ -237,6 +251,12 @@ function RelayTile({
               className="block w-full rounded px-3 py-1.5 text-left text-sm text-lc-muted hover:bg-lc-card hover:text-lc-white"
             >
               Switch to relay
+            </button>
+            <button
+              onClick={() => { void copyShareLink(); }}
+              className="block w-full rounded px-3 py-1.5 text-left text-sm text-lc-muted hover:bg-lc-card hover:text-lc-white"
+            >
+              {copied ? 'Copied!' : 'Copy share link'}
             </button>
             <button
               onClick={() => { setMenu(false); onRemove(); }}
