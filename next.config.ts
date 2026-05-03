@@ -21,6 +21,16 @@ const nextConfig: NextConfig = {
         destination: 'https://obelisk.ar/:path*',
         permanent: true,
       },
+      {
+        source: '/chat',
+        destination: '/app',
+        permanent: true,
+      },
+      {
+        source: '/chat/:path*',
+        destination: '/app/:path*',
+        permanent: true,
+      },
     ];
   },
   async headers() {
