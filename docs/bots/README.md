@@ -39,12 +39,14 @@ with the admin role attached on top.
 ```
 scripts/
 ├── price-bot.mjs         # BTC ticker bot
+├── list-groups.mjs       # one-off discovery utility (see docs/bots/discovery.md)
 └── <your-bot>.mjs        # one file per bot
 
 docs/bots/
 ├── README.md             # this file — taxonomy, lifecycle, conventions
 ├── price-bot.md          # operational guide for the price bot
-└── admin-bot.md          # design pattern for admin/moderation bots
+├── admin-bot.md          # design pattern for admin/moderation bots
+└── discovery.md          # how to enumerate groups on a relay
 
 .env.local                # secrets (gitignored): BOT_NSEC, BOT_GROUP_ID, ...
 ```
@@ -83,6 +85,20 @@ docs/bots/
 
 6. **Verify** with `pm2 logs obelisk-<your-bot>`. The bot logs its own npub at
    startup — sanity-check it matches what you whitelisted/admitted.
+
+## NIP-01 quirk: filters as struct, not array
+
+The Obelisk relays (and other relay29-derived relays) reject
+multi-filter REQs sent by `pool.subscribeMany`:
+
+```
+NOTICE: Invalid message format: invalid type: sequence, expected struct Filter
+```
+
+Always use `pool.subscribe(relays, singleFilter, params)` for relay29
+hosts. `subscribeMany` works on strfry/khatru and is fine for general
+Nostr relays — but in this repo, default to `subscribe`. The bridge
+already does this; new bots should follow the same pattern.
 
 ## Failure modes
 

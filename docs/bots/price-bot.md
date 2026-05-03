@@ -1,41 +1,64 @@
 # Price Bot
 
-`scripts/price-bot.mjs` — publishes BTC market data as the bot's own kind:0
-profile metadata, so its display name in any client renders as
-`BTC $123,456`. Optional: posts a kind 9 hello to a target group on startup.
+`scripts/price-bot.mjs` — multi-relay, multi-group BTC bot. Publishes BTC
+market data as kind:0 metadata (display name = `BTC $123,456`), posts a
+kind 9 hello + slash-command listener into each configured group, and
+optionally pushes periodic kind 9 price summaries.
 
-## What it does
+## Capabilities
 
-On a fixed interval (default 2 minutes):
-
-1. Fetches BTC stats from CoinGecko (`current_price`, 24h high/low, 24h
-   change, ATH, % from ATH).
-2. If the rounded USD price has changed since the last tick, publishes a
-   kind:0 metadata event signed by `BOT_NSEC`:
-   - `name` / `display_name`: `BTC $<price>` (template configurable)
-   - `about`: 4-line summary (price, range, ATH, timestamp)
-   - `picture`: bitcoin.org logo
-
-On startup, if `BOT_GROUP_ID` is set:
-
-- Publishes kind 9021 (`group/join-request`) — admin must approve via 9000.
-- Publishes a kind 9 chat message announcing itself to the group. Relays
-  will drop this until the bot is admitted.
+| # | Capability | Event kinds | Notes |
+|---|---|---|---|
+| 1 | Profile ticker | kind 0 | Published to every URL in `BOT_RELAYS`. The bot's display name updates every time the rounded USD price changes. |
+| 2 | Group hello + join-request | kind 9, 9021 | One-shot per group at startup. Open NIP-29 groups auto-admit on 9021; closed groups require an admin kind 9000 add-user. |
+| 3 | Slash-command listener | kind 9 | Subscribes to chat in each configured group; replies to `!btc`, `!price`, `!ath`, `!stats`, `!help` with fresh CoinGecko data. |
+| 4 | Periodic chat summary | kind 9 | If `BOT_CHAT_EVERY_N_TICKS > 0`, posts a multi-line price/ATH summary to every group every N price-change ticks. |
+| 5 | NIP-42 AUTH | kind 22242 | `automaticallyAuth` callback signs challenges with the bot nsec — required by `relay.obelisk.ar`. |
+| 6 | Graceful shutdown | — | SIGINT/SIGTERM exits cleanly so PM2 restarts don't leak sockets. |
 
 ## Configuration
 
-All via `.env.local`:
+All via `.env.local` (gitignored, read by PM2 through Node's
+`--env-file-if-exists`). Falls back to sensible defaults when unset.
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
-| `BOT_NSEC` | yes | — | `nsec1...` or 64-char hex |
-| `BOT_GROUP_ID` | no | unset | NIP-29 group id (the `c=` query param in `https://obelisk.ar/app?c=...`) |
-| `BOT_INTERVAL_MS` | no | `120000` | Price refresh interval, ms |
-| `BOT_DISPLAY` | no | `BTC ${price}` | Template, `${price}` is interpolated |
+| `BOT_NSEC` | yes | — | `nsec1...` or 64-char hex. The bot's identity. |
+| `BOT_RELAYS` | no | `wss://relay.obelisk.ar` | Comma-separated. Where kind:0 is broadcast. |
+| `BOT_GROUPS` | no | empty | Comma-separated `relayUrl|groupId` pairs. The bot joins, listens, and chats in each. |
+| `BOT_INTERVAL_MS` | no | `120000` | Price-fetch interval, ms. CoinGecko rate-limits ~10/min for the free tier. |
+| `BOT_CHAT_EVERY_N_TICKS` | no | `0` (off) | If >0, post a kind 9 summary every N **price-change** ticks (not wall-clock ticks). |
+| `BOT_DISPLAY` | no | `BTC ${price}` | Template for kind:0 `name`. `${price}` interpolated with comma-formatted USD. |
+| `BOT_GROUP_ID` | no | — | **Legacy.** Treated as a single group on the first `BOT_RELAYS` entry. Prefer `BOT_GROUPS`. |
 
-Relay is hardcoded to `wss://relay.obelisk.ar` (`RELAY` constant in the
-script). Add public relays to the publish list if you want the bot's
-profile to resolve on damus/primal/etc.
+### Discovering group ids
+
+Use `scripts/list-groups.mjs` to enumerate kind 39000 metadata on a relay:
+
+```bash
+node scripts/list-groups.mjs wss://public.obelisk.ar
+node scripts/list-groups.mjs wss://public.obelisk.ar "general"   # filter
+```
+
+Output is `id [open/closed/public/private] name — about`. Drop the id into
+`BOT_GROUPS`.
+
+## Slash commands
+
+The bot listens to kind 9 events with `#h=<groupId>` since startup, looks
+for a leading `!cmd`, and replies with a kind 9 tagged with `e` (the
+trigger event id) and `p` (the asker's pubkey). Re-deliveries are
+deduped by event id.
+
+| Command | Reply |
+|---|---|
+| `!btc` / `!price` | One-line: `⚡ BTC/USD $123,456 (+1.23% 24h)` |
+| `!ath` | One-line: `🏔 ATH $123,456 (-8.45% from ATH, currently $112,900)` |
+| `!stats` | Four-line: price, range, ATH, timestamp |
+| `!help` | Lists available commands |
+
+Add commands by extending `commandReply()` in the script — keep replies
+short to avoid notification spam.
 
 ## Running
 
@@ -45,7 +68,7 @@ Direct (foreground, debugging):
 node --env-file-if-exists=.env.local scripts/price-bot.mjs
 ```
 
-PM2 (production):
+PM2 (production, what `obelisk-price-bot` runs):
 
 ```bash
 pm2 start scripts/price-bot.mjs \
@@ -54,47 +77,41 @@ pm2 start scripts/price-bot.mjs \
 pm2 save
 ```
 
-The bot logs its own npub at startup — capture this to whitelist/admit it.
+The bot logs each capability's success/failure on its own line. Healthy
+startup looks like:
 
-## Admitting the bot to a group
-
-The bot's join-request alone is not enough — a relay enforcing NIP-29 will
-drop posts from non-members. As the group admin, publish a kind 9000:
-
-```ts
-import { getBridge } from '@/lib/nostr-bridge';
-const bridge = await getBridge();
-await bridge.addUserToGroup(groupId, botPubkeyHex);    // member
-// or, for admin role:
-await bridge.addAdminToGroup(groupId, botPubkeyHex, ['ban','timeout']);
+```
+[price-bot] pubkey npub: npub1...
+[price-bot] relays:      wss://relay.obelisk.ar, wss://public.obelisk.ar
+[price-bot] groups:      wss://relay.obelisk.ar|dab35d..., wss://public.obelisk.ar|26a9cc...
+[price-bot] join-request sent: wss://public.obelisk.ar 26a9cced
+[price-bot] hello sent: wss://public.obelisk.ar 26a9cced
+[price-bot] kind:0 → BTC 78,587 (+0.06% 24h)
 ```
 
-(Use whatever helpers the bridge exposes today; the underlying event is
-`{ kind: 9000, tags: [['h', groupId], ['p', botPubkey, ...roles]] }`.)
-
-After admission the relay will accept the bot's kind 9 / kind 9005
-messages, and `relay.obelisk.ar` will start emitting the bot's pubkey in
-kind 39002 (members) — at which point the bot shows up in the in-app
-member list at `https://obelisk.ar/app?c=<groupId>`.
-
-## Verifying it's working
+## Verifying
 
 ```bash
 pm2 logs obelisk-price-bot --lines 50
 ```
 
-Expected lines on a healthy bot:
+For the live group view, open
+`https://obelisk.ar/app?c=<groupId>` and look for the bot in the member
+list (display name is the live BTC price). Send `!btc` in chat to
+sanity-check the command listener.
 
-```
-[price-bot] starting on wss://relay.obelisk.ar
-[price-bot] pubkey (npub): npub1...
-[price-bot] sent join-request for group <id>
-[price-bot] sent hello message to group <id>
-[price-bot] published BTC $123,456 (+1.23% 24h, -8.45% ATH)
-```
+## Why it might not show up
 
-If you see `All promises were rejected` on every publish, the relay is
-rejecting the events — see [README § Failure modes](./README.md#failure-modes).
+1. **Relay rejected publishes** (`All promises were rejected` on every
+   line) — npub not whitelisted on the relay, or AUTH failed. Confirm
+   you whitelisted the npub printed at startup.
+2. **Bot in chat but not in member list** — for closed groups, ask an
+   admin to issue kind 9000 add-user. Open NIP-29 groups should
+   auto-admit on the bot's 9021 join-request, but some relay
+   implementations defer this until the next 39002 republish.
+3. **Profile not resolving** — kind:0 only goes to `BOT_RELAYS`. If you
+   want the bot's profile to render in clients connected to other
+   relays (damus, primal, nostr.band), add those to `BOT_RELAYS`.
 
 ## Stopping / rotating
 
@@ -104,6 +121,7 @@ pm2 delete obelisk-price-bot
 pm2 save
 ```
 
-To rotate the nsec: stop the bot, generate a fresh nsec, update
-`.env.local`, restart, then issue a new kind 9000 add-user with the new
-pubkey (and optionally kind 9001 remove-user with the old one).
+Rotate the nsec: stop the bot, generate a new nsec, update `.env.local`,
+re-whitelist on each relay, restart. If the bot was admin-added by kind
+9000, you'll need a fresh 9000 add-user with the new pubkey (and
+optionally 9001 remove-user with the old one) signed by a human admin.
