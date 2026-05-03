@@ -13,6 +13,9 @@
 #   SKIP_BUILD=1      reuse existing .next/
 #   SKIP_TUNNEL=1     skip cloudflared
 #   FORCE_KILL=1      kill anything on $PORT instead of failing
+#   PM2_APP           default: obelisk-dex  (if registered with PM2, raise will pm2-restart it
+#                     instead of starting next directly — avoids fighting the supervisor)
+#   PM2_TUNNEL        default: obelisk-dex-tunnel  (if registered, the cloudflared step is skipped)
 
 set -u
 
@@ -79,16 +82,43 @@ else
   green "Build complete."
 fi
 
+# ── PM2 fast path ────────────────────────────────────────────────
+# If obelisk-dex is supervised by PM2, restart that instead of fighting it
+# for port $PORT. PM2 will respawn the old build otherwise.
+PM2_APP="${PM2_APP:-obelisk-dex}"
+PM2_TUNNEL="${PM2_TUNNEL:-obelisk-dex-tunnel}"
+if command -v pm2 >/dev/null 2>&1 && pm2 id "$PM2_APP" 2>/dev/null | grep -q '[0-9]'; then
+  step "PM2-managed app detected ($PM2_APP)"
+  blue "pm2 restart $PM2_APP --update-env"
+  pm2 restart "$PM2_APP" --update-env >/dev/null
+  sleep 2
+  if ! pm2 jlist 2>/dev/null | grep -q "\"name\":\"$PM2_APP\".*\"status\":\"online\""; then
+    red "PM2 app failed to come online. Recent logs:"
+    pm2 logs "$PM2_APP" --lines 20 --nostream 2>/dev/null || true
+    exit 1
+  fi
+  green "App online via PM2."
+  if pm2 id "$PM2_TUNNEL" 2>/dev/null | grep -q '[0-9]'; then
+    dim "Tunnel ($PM2_TUNNEL) supervised by PM2 — leaving as-is."
+    SKIP_TUNNEL=1
+  fi
+  step "Raised"
+  green "Local:    http://127.0.0.1:$PORT"
+  [ "$SKIP_TUNNEL" = "1" ] && green "Public:   https://$TUNNEL_HOST  (PM2 tunnel)"
+  dim   "Logs:   pm2 logs $PM2_APP"
+  exit 0
+fi
+
 # ── Port check ───────────────────────────────────────────────────
 step "Production server on port $PORT"
-pids=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+pids=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || ss -ltnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p { match($0,/pid=([0-9]+)/,a); if (a[1]) print a[1] }' | sort -u)
 if [ -n "$pids" ]; then
   cmd=$(ps -p "$(echo "$pids" | head -1)" -o command= 2>/dev/null || true)
   blue "Port $PORT held by: $cmd"
   if [ "$FORCE_KILL" = "1" ]; then
     blue "FORCE_KILL=1 — killing."
     kill $pids 2>/dev/null || true; sleep 1
-    still=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+    still=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || ss -ltnp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p { match($0,/pid=([0-9]+)/,a); if (a[1]) print a[1] }' | sort -u)
     [ -n "$still" ] && { kill -9 $still 2>/dev/null || true; sleep 1; }
   else
     red "Port $PORT in use. Free it or set FORCE_KILL=1."; exit 1
