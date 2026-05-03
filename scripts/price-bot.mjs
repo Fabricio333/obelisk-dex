@@ -65,7 +65,12 @@ async function main() {
   console.log(`[price-bot] pubkey (npub): ${npub}`);
   console.log('[price-bot] ^ whitelist this npub on the relay / add to your group');
 
-  const pool = new SimplePool();
+  // relay.obelisk.ar requires NIP-42 AUTH. SimplePool resolves
+  // `automaticallyAuth(relayUrl)` per challenge — we sign it with the bot's
+  // own nsec.
+  const pool = new SimplePool({
+    automaticallyAuth: () => async (evt) => finalizeEvent(evt, sk),
+  });
 
   if (GROUP_ID) {
     const join = finalizeEvent({
