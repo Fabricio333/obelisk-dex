@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "node --env-file-if-exists=.env.local scripts/dev.mjs",
+    "dev:next": "next dev",
     "dev:raise": "./scripts/dev-raise.sh",
     "raise": "./scripts/raise.sh",
     "deploy": "./scripts/deploy.sh",

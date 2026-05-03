@@ -98,11 +98,13 @@ fi
 # ── Launch ───────────────────────────────────────────────────────
 APP_PID=""
 TUNNEL_PID=""
+BOT_PID=""
 
 cleanup() {
   echo
   blue "Shutting down…"
   [ -n "$TUNNEL_PID" ] && kill "$TUNNEL_PID" 2>/dev/null || true
+  [ -n "$BOT_PID" ]    && kill "$BOT_PID"    2>/dev/null || true
   [ -n "$APP_PID" ]    && kill "$APP_PID"    2>/dev/null || true
   wait 2>/dev/null || true
 }
@@ -119,6 +121,27 @@ for i in $(seq 1 60); do
   sleep 1
 done
 lsof -iTCP:"$PORT" -sTCP:LISTEN -n -P >/dev/null 2>&1 || { red "App didn't start within 60s. See app.log"; exit 1; }
+
+# ── Price bot (optional) ─────────────────────────────────────────
+if [ -n "${BOT_NSEC:-}" ]; then
+  step "Price bot"
+  blue "Starting price-bot (logs → ./bot.log)…"
+  BOT_NSEC="$BOT_NSEC" \
+  BOT_GROUP_ID="${BOT_GROUP_ID:-}" \
+  BOT_INTERVAL_MS="${BOT_INTERVAL_MS:-}" \
+  BOT_DISPLAY="${BOT_DISPLAY:-}" \
+    node scripts/price-bot.mjs > bot.log 2>&1 &
+  BOT_PID=$!
+  sleep 1
+  if ! kill -0 "$BOT_PID" 2>/dev/null; then
+    red "price-bot died. Last 20 log lines:"; tail -20 bot.log
+    BOT_PID=""
+  else
+    green "Bot up (PID $BOT_PID)."
+  fi
+else
+  dim "BOT_NSEC not set — skipping price bot."
+fi
 
 if [ "$SKIP_TUNNEL" = "1" ]; then
   step "Ready"
@@ -158,5 +181,9 @@ echo
 while :; do
   [ -n "$TUNNEL_PID" ] && ! kill -0 "$TUNNEL_PID" 2>/dev/null && { red "Tunnel exited."; break; }
   ! kill -0 "$APP_PID" 2>/dev/null && { red "App exited."; break; }
+  if [ -n "$BOT_PID" ] && ! kill -0 "$BOT_PID" 2>/dev/null; then
+    red "Price bot exited. Last 20 log lines:"; tail -20 bot.log
+    BOT_PID=""
+  fi
   sleep 2
 done
