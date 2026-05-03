@@ -71,6 +71,7 @@ import {
 } from '@/lib/relay-branding';
 import BlossomImageInput from '@/components/BlossomImageInput';
 import ActivityIndicator from '@/components/ActivityIndicator';
+import { extractUrls, isImageUrl } from '@/lib/markdown';
 
 type View =
   | { kind: 'group'; groupId: string }
@@ -749,7 +750,7 @@ function GroupNode({
   return (
     <>
       <div
-        style={{ paddingLeft: `${0.5 + depth * 0.85}rem` }}
+        style={{ paddingLeft: `${0.5 + Math.max(0, depth - 1) * 0.85}rem` }}
         className={
           'flex w-full items-center gap-1 rounded text-left text-sm transition ' +
           (active
@@ -757,18 +758,7 @@ function GroupNode({
             : 'text-lc-muted hover:bg-lc-card hover:text-lc-white')
         }
       >
-        {isCollapsible ? (
-          <button
-            onClick={toggleCollapsed}
-            className="shrink-0 px-1 py-1.5 text-[10px] text-lc-muted hover:text-lc-white"
-            aria-label={collapsed ? 'Expand threads' : 'Collapse threads'}
-            title={collapsed ? 'Expand threads' : 'Collapse threads'}
-          >
-            {collapsed ? '▸' : '▾'}
-          </button>
-        ) : (
-          depth > 0 && <span className="pl-1 text-lc-muted">↳</span>
-        )}
+        {depth > 0 && !isCollapsible && <span className="pl-1 text-lc-muted">↳</span>}
         <button
           onClick={() => onSelect(group.id)}
           className="flex flex-1 items-center gap-2 truncate px-1 py-1.5 text-left"
@@ -778,6 +768,16 @@ function GroupNode({
           {!group.isPublic && <span title="Private" className="text-[10px]">🔒</span>}
           {!group.isOpen && <span title="Closed (invite only)" className="text-[10px]">⊝</span>}
         </button>
+        {isCollapsible && (
+          <button
+            onClick={toggleCollapsed}
+            className="shrink-0 px-2 py-1.5 text-sm text-lc-white/70 hover:text-lc-green"
+            aria-label={collapsed ? 'Expand threads' : 'Collapse threads'}
+            title={collapsed ? 'Expand threads' : 'Collapse threads'}
+          >
+            {collapsed ? '▸' : '▾'}
+          </button>
+        )}
       </div>
       {!collapsed && childIds.map((cid) => {
         const child = groupsById[cid];
@@ -1614,16 +1614,21 @@ function ChatPanel({
   }
 
   const [uploadingMedia, setUploadingMedia] = useState(false);
-  async function onPickFile(file: File) {
+  async function onPickFiles(files: File[]) {
+    if (files.length === 0) return;
+    // Cap at 4 — matches the gallery's 2x2 matrix renderer.
+    const batch = files.slice(0, 4);
     setUploadingMedia(true);
     setSendError(null);
     try {
       const { uploadToBlossom } = await import('@/lib/blossom');
-      const url = await uploadToBlossom(file);
-      // Inline-attach: append the Blossom URL to the draft on its own line.
-      // Renderers detect bare image/video URLs and render them as media — same
-      // convention used everywhere else in the chat (NIP-92-style).
-      setDraft((d) => (d.trim() ? `${d.trim()}\n${url}` : url));
+      const urls = await Promise.all(batch.map((f) => uploadToBlossom(f)));
+      // Inline-attach: append each Blossom URL on its own line. Renderers
+      // detect bare image/video URLs and render them as media (NIP-92-style).
+      setDraft((d) => {
+        const base = d.trim();
+        return base ? `${base}\n${urls.join('\n')}` : urls.join('\n');
+      });
     } catch (err) {
       setSendError((err as Error).message || 'Upload failed');
     } finally {
@@ -1832,6 +1837,41 @@ function ChatPanel({
         {activeSlashCommand && (
           <SlashCommandScaffold command={activeSlashCommand} content={draft} caret={caret} />
         )}
+        {(() => {
+          const pendingImages = extractUrls(draft).filter(isImageUrl).slice(0, 4);
+          if (pendingImages.length === 0 && !uploadingMedia) return null;
+          const removeUrl = (url: string) => {
+            setDraft((d) =>
+              d
+                .split('\n')
+                .filter((line) => line.trim() !== url)
+                .join('\n')
+                .replace(/\n{3,}/g, '\n\n'),
+            );
+          };
+          return (
+            <div className="mb-2 flex flex-wrap items-center gap-2 rounded-xl border border-lc-border bg-lc-card/50 p-2">
+              {pendingImages.map((url) => (
+                <div key={url} className="group relative h-16 w-16 overflow-hidden rounded-lg bg-lc-black">
+                  <img src={url} alt="" className="h-full w-full object-cover" />
+                  <button
+                    type="button"
+                    onClick={() => removeUrl(url)}
+                    className="absolute right-0.5 top-0.5 flex h-5 w-5 items-center justify-center rounded-full bg-black/70 text-[11px] text-lc-white opacity-90 hover:bg-black"
+                    aria-label="Remove attachment"
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+              {uploadingMedia && (
+                <div className="flex h-16 w-16 items-center justify-center rounded-lg border border-dashed border-lc-border text-[10px] uppercase tracking-wider text-lc-muted">
+                  …
+                </div>
+              )}
+            </div>
+          );
+        })()}
         <div className="flex min-h-[3.5rem] items-center gap-2 rounded-xl border border-lc-border bg-lc-card px-4 focus-within:border-lc-green">
           <label
             className="cursor-pointer text-lc-muted hover:text-lc-white"
@@ -1848,11 +1888,12 @@ function ChatPanel({
             <input
               type="file"
               accept="image/*,video/*"
+              multiple
               className="hidden"
               disabled={uploadingMedia || sending}
               onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) void onPickFile(f);
+                const files = Array.from(e.target.files ?? []);
+                if (files.length > 0) void onPickFiles(files);
                 e.target.value = '';
               }}
             />
@@ -1886,6 +1927,22 @@ function ChatPanel({
               onSelect={(e) => {
                 const t = e.currentTarget;
                 detectMention(t.value, t.selectionStart ?? t.value.length);
+              }}
+              onPaste={(e) => {
+                const items = Array.from(e.clipboardData?.items ?? []);
+                const files: File[] = [];
+                for (const it of items) {
+                  if (it.kind === 'file') {
+                    const f = it.getAsFile();
+                    if (f && (f.type.startsWith('image/') || f.type.startsWith('video/'))) {
+                      files.push(f);
+                    }
+                  }
+                }
+                if (files.length > 0) {
+                  e.preventDefault();
+                  void onPickFiles(files);
+                }
               }}
               placeholder={`Message #${group?.name ?? groupId.slice(0, 8)}`}
               disabled={sending}

@@ -53,7 +53,7 @@ export default function ImageGallery({ urls }: ImageGalleryProps) {
     return (
       <>
         <div
-          className="mt-1 max-w-sm rounded-lg overflow-hidden bg-lc-black/50 cursor-pointer"
+          className="mt-1 w-fit max-w-sm rounded-lg overflow-hidden bg-lc-black/50 cursor-pointer"
           onClick={() => open(0)}
           data-testid="image-gallery"
           data-count="1"
