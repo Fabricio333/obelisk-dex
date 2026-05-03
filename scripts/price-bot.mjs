@@ -162,21 +162,33 @@ async function main() {
   // to known commands. Uses an in-memory `seen` set so re-deliveries on
   // reconnect don't re-trigger.
   const seen = new Set();
-  const startedAt = Math.floor(Date.now() / 1000);
-  for (const { relay, groupId } of GROUPS) {
-    pool.subscribe(
-      [relay],
-      { kinds: [9], '#h': [groupId], since: startedAt - 5 },
-      {
-        // SimplePool's automaticallyAuth (set on the pool) covers AUTH for both
-        // EVENT publishes and REQ subscribes — we don't need a per-sub onauth.
-        // If the listener ever stops receiving messages, flip BOT_DEBUG=1 to log
-        // every kind 9 event arriving on the wire.
-        oneose: () => console.log(`[price-bot] sub EOSE ${relay} ${groupId.slice(0,8)} (listener ready)`),
-        onevent: async (ev) => {
-          if (process.env.BOT_DEBUG === '1') {
-            console.log(`[price-bot] saw kind:9 from ${ev.pubkey.slice(0,8)} on ${groupId.slice(0,8)}: ${ev.content.slice(0,60)}`);
-          }
+  // relay29 (relay.obelisk.ar / public.obelisk.ar) closes REQs after EOSE
+  // instead of streaming live events — the bridge reconnects on every
+  // onclose, and so do we. Without this the listener silently dies the
+  // moment EOSE fires.
+  const subscribeListener = (relay, groupId) => {
+    let since = Math.floor(Date.now() / 1000) - 5;
+    let closed = false;
+    const open = () => {
+      if (closed) return;
+      const sub = pool.subscribe(
+        [relay],
+        { kinds: [9], '#h': [groupId], since },
+        {
+          onauth: async () => null, // automaticallyAuth at the pool level signs the AUTH challenge
+          oneose: () => console.log(`[price-bot] sub EOSE ${relay} ${groupId.slice(0,8)}`),
+          onclose: () => {
+            if (closed) return;
+            // Bump `since` past the last event we've handled so reconnects
+            // don't replay history we already processed.
+            since = Math.floor(Date.now() / 1000);
+            setTimeout(open, 1500);
+          },
+          onevent: async (ev) => {
+            since = Math.max(since, ev.created_at);
+            if (process.env.BOT_DEBUG === '1') {
+              console.log(`[price-bot] saw kind:9 from ${ev.pubkey.slice(0,8)} on ${groupId.slice(0,8)}: ${ev.content.slice(0,60)}`);
+            }
           if (ev.pubkey === pk) return;
           if (seen.has(ev.id)) return;
           seen.add(ev.id);
@@ -200,10 +212,14 @@ async function main() {
           } catch (err) {
             console.warn(`[price-bot] command !${m[1]} failed:`, err?.message || err);
           }
+          },
         },
-      },
-    );
-  }
+      );
+      return () => { closed = true; sub.close(); };
+    };
+    open();
+  };
+  for (const { relay, groupId } of GROUPS) subscribeListener(relay, groupId);
 
   // ── Group hello + join-request, once per (relay, groupId) ever ──────
   // State persisted to ~/.obelisk-price-bot-state.json so PM2 restarts and
