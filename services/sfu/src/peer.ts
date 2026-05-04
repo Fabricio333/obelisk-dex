@@ -118,16 +118,23 @@ export class Peer {
     this.send = opts.send;
     this.sessionId = randomSessionId();
 
+    // SFU_FORCE_RELAY=1 forces iceTransportPolicy: 'relay' so the SFU
+    // ONLY uses TURN candidates. Useful when the cloud network blocks
+    // direct inbound UDP on the configured RTP port range (the SFU
+    // never receives a packet on its host candidate, ICE never
+    // succeeds, peers loop on requestReset). Forcing relay routes the
+    // media browser ↔ TURN ↔ SFU which only requires outbound UDP.
+    const forceRelay = (process.env.SFU_FORCE_RELAY ?? '').trim() === '1';
     this.pc = new RTCPeerConnection({
       iceServers: opts.iceServers,
       bundlePolicy: 'max-bundle',
-      iceTransportPolicy: 'all',
+      iceTransportPolicy: forceRelay ? 'relay' : 'all',
       // werift port range — pin RTP to the configured range so a host
       // firewall / cloud security group can pinhole exactly these ports.
       icePortRange: [opts.rtpPortMin, opts.rtpPortMax],
       // Advertise this as a candidate when set — needed for 1:1 NAT
       // hosts (AWS, GCP) where the host can't see its own public IP.
-      ...(opts.publicIp ? { iceAdditionalHostAddresses: [opts.publicIp] } : {}),
+      ...(opts.publicIp && !forceRelay ? { iceAdditionalHostAddresses: [opts.publicIp] } : {}),
     });
 
     this.attachListeners();
