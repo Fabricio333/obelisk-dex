@@ -209,9 +209,21 @@ DEV_PID=""
 TUNNEL_PID=""
 TUNNEL_REUSED=0
 
-# No EXIT trap — we launch children detached with nohup+disown so the
-# script can return and the dev server / tunnel keep running. Use the
-# `stop` subcommand (above) to take them down.
+# Attached mode: children spawned by THIS run are killed when the script
+# exits (Ctrl-C, terminal close, SIGHUP). Reused processes are left alone.
+cleanup() {
+  trap - EXIT INT TERM HUP
+  [ -n "$DEV_PID" ] && kill -0 "$DEV_PID" 2>/dev/null && {
+    dim "stopping next dev (pid $DEV_PID)…"
+    kill -TERM "$DEV_PID" 2>/dev/null || true
+    pkill -TERM -P "$DEV_PID" 2>/dev/null || true
+  }
+  [ -n "$TUNNEL_PID" ] && kill -0 "$TUNNEL_PID" 2>/dev/null && {
+    dim "stopping cloudflared (pid $TUNNEL_PID)…"
+    kill -TERM "$TUNNEL_PID" 2>/dev/null || true
+  }
+}
+trap cleanup EXIT INT TERM HUP
 
 if [ "$DEV_ALREADY_RUNNING" = "0" ]; then
   if [ "$CLEAN_NEXT_CACHE" = "1" ] && [ -d .next ]; then
@@ -226,9 +238,8 @@ if [ "$DEV_ALREADY_RUNNING" = "0" ]; then
     blue "Starting next dev on :$PORT (turbopack) (logs → ./dev.log)…"
   fi
   # shellcheck disable=SC2086
-  PORT="$PORT" nohup npx next dev $DEV_FLAGS > dev.log 2>&1 &
+  PORT="$PORT" npx next dev $DEV_FLAGS > dev.log 2>&1 &
   DEV_PID=$!
-  disown "$DEV_PID" 2>/dev/null || true
   for i in $(seq 1 60); do
     lsof -iTCP:"$PORT" -sTCP:LISTEN -n -P >/dev/null 2>&1 && { green "Dev server up."; break; }
     if ! kill -0 "$DEV_PID" 2>/dev/null; then
@@ -242,7 +253,10 @@ fi
 if [ "$SKIP_TUNNEL" = "1" ]; then
   step "Ready"
   green "Dev: http://127.0.0.1:$PORT  (SKIP_TUNNEL=1)"
-  [ -n "$DEV_PID" ] && dim "Dev PID $DEV_PID — running in background. Stop: ./scripts/dev-raise.sh stop"
+  if [ -n "$DEV_PID" ]; then
+    dim "Dev PID $DEV_PID — Ctrl-C or close terminal to stop."
+    wait "$DEV_PID"
+  fi
   exit 0
 fi
 
@@ -253,7 +267,7 @@ if pgrep -f "cloudflared .* ${TUNNEL_UUID}" >/dev/null 2>&1 \
   TUNNEL_REUSED=1
 else
   blue "Starting cloudflared '$TUNNEL_NAME' → $ORIGIN_URL (logs → ./tunnel.log)"
-  nohup cloudflared --origincert "$ORIGIN_CERT" tunnel \
+  cloudflared --origincert "$ORIGIN_CERT" tunnel \
     --config /dev/null \
     --cred-file "$CRED_FILE" \
     run \
@@ -261,7 +275,6 @@ else
     --no-tls-verify \
     "$TUNNEL_UUID" > tunnel.log 2>&1 &
   TUNNEL_PID=$!
-  disown "$TUNNEL_PID" 2>/dev/null || true
   sleep 2
   if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
     red "cloudflared died. Last 20 log lines:"; tail -20 tunnel.log; exit 1
@@ -359,6 +372,16 @@ green "Local:  http://127.0.0.1:$PORT"
 green "Public: https://$TUNNEL_HOST"
 dim   "Logs:   ./dev.log  ./tunnel.log"
 dim   "PIDs:   ${DEV_PID:+dev=$DEV_PID  }${TUNNEL_PID:+tunnel=$TUNNEL_PID}"
-dim   "Stop:   ./scripts/dev-raise.sh stop"
+dim   "Stop:   Ctrl-C (or close terminal) — children spawned by this run will be killed."
+dim   "        Reused processes (if any) survive; use ./scripts/dev-raise.sh stop for those."
 echo
+
+# Stay attached so SIGHUP / Ctrl-C tears down what we started.
+wait_pids=""
+[ -n "$DEV_PID" ] && wait_pids="$wait_pids $DEV_PID"
+[ -n "$TUNNEL_PID" ] && wait_pids="$wait_pids $TUNNEL_PID"
+if [ -n "$wait_pids" ]; then
+  # shellcheck disable=SC2086
+  wait $wait_pids
+fi
 exit 0
