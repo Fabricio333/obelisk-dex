@@ -20,7 +20,8 @@ import { setActiveVoiceClient, getActiveVoiceClient } from '@/lib/voice/active-c
 import { getBridge } from '@/lib/nostr-bridge/client';
 import type { NostrBridge } from '@/lib/nostr-bridge/types';
 import { useVoiceStore } from '@/store/voice';
-import { useUserMetadata } from '@/lib/nostr-bridge';
+import { useGroups, useUserMetadata } from '@/lib/nostr-bridge';
+import { ensureSfuRoomStarted } from '@/lib/voice/sfu-control';
 import VoiceControls from './VoiceControls';
 import ShootingStars from '@/components/ShootingStars';
 import { qualityColor, type QualitySample } from '@/lib/voice/stats';
@@ -42,6 +43,11 @@ type AuthGate =
 
 export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen, onToggleChat }: Props) {
   const router = useRouter();
+  const groups = useGroups();
+  const channelKind = useMemo(
+    () => groups.find((g) => g.id === channelId)?.kind ?? null,
+    [groups, channelId],
+  );
   const clientRef = useRef<VoiceClient | null>(null);
   const [gate, setGate] = useState<AuthGate>({ phase: 'init' });
   const [error, setError] = useState<string | null>(null);
@@ -57,6 +63,23 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
     const c = getActiveVoiceClient();
     return !!(c && c.channelId === channelId && c.isJoined());
   });
+
+  /**
+   * SFU upgrade status for the current call. Distinct from voice-client
+   * mesh/sfu topology because it also captures the pre-connect states the
+   * UI needs to display:
+   *
+   *   - 'na'           — channel is not voice-sfu (no banner)
+   *   - 'starting'     — kind 25052 published, waiting for SFU's beacon
+   *   - 'connected'    — SFU peer in roster, media routes through it
+   *   - 'unavailable'  — no kind 31313 advertisement found; mesh fallback
+   *   - 'unauthorized' — start published but SFU never joined within
+   *                      the watchdog window — likely the publisher is
+   *                      not whitelisted on the SFU's trusted-author relay
+   */
+  const [sfuStatus, setSfuStatus] = useState<
+    'na' | 'starting' | 'connected' | 'unavailable' | 'unauthorized'
+  >('na');
 
   // Phase 1 — bridge + role subscriptions, gate decision.
   useEffect(() => {
@@ -186,6 +209,22 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
         s.setCameraOn(l.camera);
         s.setScreenSharing(l.screen);
       },
+      onTopologyChange: (sfu: string | null) => {
+        if (cancelled) return;
+        // Only voice-sfu channels are tracking SFU upgrade status; for
+        // a plain voice channel an SFU showing up wouldn't make sense
+        // anyway, but keep the state machine local to that channel kind.
+        if (channelKind !== 'voice-sfu') return;
+        if (sfu) {
+          setSfuStatus('connected');
+        } else {
+          // Topology dropped back to mesh after being on the SFU. The
+          // start trigger effect re-runs the watchdog if the user is still
+          // in the call, so flip to 'starting' so the UI says "trying
+          // again" instead of declaring the call mesh.
+          setSfuStatus('starting');
+        }
+      },
       onError: (m: string) => {
         if (cancelled) return;
         setError(m);
@@ -254,6 +293,52 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gate.phase, channelId, joined]);
+
+  // Big-room channels (`voice-sfu`) need the SFU to have an active room
+  // before any beacon flips topology to SFU mode. We publish kind 25052
+  // `start` once the user is gated+joined AND we know the channel kind,
+  // then wait for the SFU's `["sfu","1"]` beacon to land — the
+  // `onTopologyChange` event flips status to 'connected'. If nothing
+  // arrives within `SFU_JOIN_WATCHDOG_MS` the publish was either silently
+  // rejected (publisher not whitelisted on the trusted-author relay) or
+  // the SFU is offline; status flips to 'unauthorized' so the UI tells
+  // the user instead of pretending the call is on the SFU.
+  //
+  // Kept in its own effect so a late-arriving kind metadata flip from
+  // null → 'voice-sfu' still triggers a start without tearing down the
+  // running VoiceClient. The publish itself is rate-limited inside
+  // `ensureSfuRoomStarted` so re-runs don't spam.
+  useEffect(() => {
+    if (gate.phase !== 'ready') return;
+    if (!joined) return;
+    if (channelKind !== 'voice-sfu') {
+      setSfuStatus('na');
+      return;
+    }
+    let cancelled = false;
+    setSfuStatus('starting');
+    const SFU_JOIN_WATCHDOG_MS = 8000;
+    let watchdog: ReturnType<typeof setTimeout> | null = null;
+    void ensureSfuRoomStarted(channelId).then((sfuPubkey) => {
+      if (cancelled) return;
+      if (sfuPubkey) {
+        console.log('[voice] sfu start published target=', sfuPubkey.slice(0, 8));
+        // Watchdog: SFU peer must show up in our roster within this
+        // window for us to consider the call truly upgraded.
+        watchdog = setTimeout(() => {
+          if (cancelled) return;
+          setSfuStatus((prev) => (prev === 'starting' ? 'unauthorized' : prev));
+        }, SFU_JOIN_WATCHDOG_MS);
+      } else {
+        console.warn('[voice] no sfu available — falling back to mesh');
+        setSfuStatus('unavailable');
+      }
+    });
+    return () => {
+      cancelled = true;
+      if (watchdog) clearTimeout(watchdog);
+    };
+  }, [gate.phase, joined, channelKind, channelId]);
 
   const leave = useCallback(async () => {
     const c = clientRef.current ?? getActiveVoiceClient();
@@ -446,6 +531,7 @@ export default function VoiceRoom({ channelId, channelName, chatSlot, isChatOpen
       <div className="flex-1 flex flex-col min-h-0 relative overflow-hidden rounded-2xl border border-lc-border bg-gradient-to-br from-indigo-950 via-indigo-900 to-violet-800 shadow-2xl">
         <StageBackdrop />
         <RoomHeader name={displayName} count={totalCount} />
+        <SfuStatusBanner status={sfuStatus} />
 
         {/* Stage area */}
         <div className="relative z-10 flex-1 min-h-0 flex flex-col md:flex-row gap-2 sm:gap-3 p-2 sm:p-3 pb-24 sm:pb-28 overflow-hidden">
@@ -619,6 +705,78 @@ function StageBackdrop() {
         }}
       />
     </>
+  );
+}
+
+/**
+ * Inline banner that surfaces the SFU upgrade state for `voice-sfu`
+ * channels. The intent is that a user creating a Big-room voice call
+ * never has to wonder whether they're actually getting SFU forwarding
+ * or silently dropped to the 8-peer mesh.
+ *
+ *   starting     — neutral; we just published kind 25052 and are waiting
+ *   connected    — green badge; SFU's `["sfu","1"]` beacon is in our roster
+ *   unavailable  — amber; nobody has published a kind 31313 ad yet
+ *   unauthorized — red; start published but SFU never joined within 8 s
+ *                  (publisher likely not whitelisted on the trusted-author
+ *                  relay; mesh fallback is active)
+ *
+ * Plain voice / non-sfu channels render no banner ('na').
+ */
+function SfuStatusBanner({ status }: {
+  status: 'na' | 'starting' | 'connected' | 'unavailable' | 'unauthorized';
+}) {
+  if (status === 'na') return null;
+  const variants = {
+    starting: {
+      label: 'Connecting to SFU…',
+      detail: 'Asking the SFU to open this big-room call.',
+      tone: 'bg-amber-500/10 border-amber-400/30 text-amber-100',
+      dot: 'bg-amber-300',
+      pulse: true,
+    },
+    connected: {
+      label: 'SFU connected',
+      detail: 'Big-room mode active — media is routed through the SFU.',
+      tone: 'bg-emerald-500/10 border-emerald-400/30 text-emerald-100',
+      dot: 'bg-emerald-300',
+      pulse: false,
+    },
+    unavailable: {
+      label: 'No SFU available',
+      detail: 'No big-room SFU is currently advertising on the relay. Falling back to peer-to-peer mesh (max 8 participants).',
+      tone: 'bg-amber-500/10 border-amber-400/30 text-amber-100',
+      dot: 'bg-amber-300',
+      pulse: false,
+    },
+    unauthorized: {
+      label: 'SFU did not authorize this call',
+      detail: 'The big-room start was rejected. Your account may not be whitelisted on the SFU’s trusted relay. Call is on peer-to-peer mesh (max 8 participants).',
+      tone: 'bg-rose-500/10 border-rose-400/30 text-rose-100',
+      dot: 'bg-rose-300',
+      pulse: false,
+    },
+  } as const;
+  const v = variants[status];
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      data-testid="sfu-status"
+      data-sfu-status={status}
+      className={`relative z-10 mx-3 sm:mx-5 mt-2 px-3 py-2 flex items-start gap-2 rounded-lg border text-xs ${v.tone}`}
+    >
+      <span className="relative inline-flex h-2 w-2 mt-1 shrink-0">
+        {v.pulse && (
+          <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-60 ${v.dot}`} />
+        )}
+        <span className={`relative inline-flex rounded-full h-2 w-2 ${v.dot}`} />
+      </span>
+      <div className="min-w-0">
+        <div className="font-medium leading-tight">{v.label}</div>
+        <div className="opacity-80 mt-0.5">{v.detail}</div>
+      </div>
+    </div>
   );
 }
 

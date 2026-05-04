@@ -63,3 +63,30 @@ export const KIND_VOICE_SIGNAL = 25050;
  * admin/owner before acting on it.
  */
 export const KIND_VOICE_MOD_ACTION = 25051;
+
+/**
+ * Obelisk SFU — control event addressed to an SFU pubkey via `["p", sfu]`.
+ * Carries `{action, params}` JSON in content; `action` is one of
+ * `start | end | reset | drain`. Authorization is the SFU's job: arrival
+ * via a trusted-author relay (the relay's write-whitelist is the auth)
+ * OR pubkey listed in the SFU's local allow.json. See docs/sfu-system.md.
+ */
+export const KIND_SFU_CONTROL = 25052;
+
+/**
+ * Obelisk SFU — replaceable advertisement (kind 31313) published by every
+ * running SFU on its general relays. Tags carry `url`, `relay`,
+ * `trusted_relay`, `cap`, `version`, `operator`, `codec`. Voice clients
+ * read this to discover which SFU to address kind 25052 at when the user
+ * joins a `voice-sfu` channel.
+ */
+export const KIND_SFU_ADVERTISE = 31313;
+
+/**
+ * Obelisk SFU — replaceable active-call announcement (kind 31314) published
+ * by the SFU once a room has accepted a `start`. Tagged with `["d",
+ * channelId]` so it replaces previous status for the same channel.
+ * v0 dex doesn't read this (the SFU's `["sfu","1"]` voice beacon is what
+ * flips client topology), but it's documented here for parity.
+ */
+export const KIND_SFU_ACTIVE_CALL = 31314;

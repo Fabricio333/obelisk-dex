@@ -93,6 +93,14 @@ export interface VoiceClientEvents {
   onParticipantsChange?(pubkeys: string[]): void;
   onRemoteTracksChange?(tracks: RemoteTrack[]): void;
   onLocalTracksChange?(local: { mic: boolean; camera: boolean; screen: boolean }): void;
+  /**
+   * Topology change — null means "back on mesh", a hex pubkey means "now
+   * forwarding through this SFU". Fires every time `setSfuMode` flips,
+   * including the first time an SFU's beacon shows up. UI uses this to
+   * tell users whether their `voice-sfu` channel actually upgraded to
+   * the SFU or fell back to mesh because the SFU rejected the start.
+   */
+  onTopologyChange?(sfuPubkey: string | null): void;
   onError?(message: string): void;
   onLeft?(reason?: string): void;
 }
@@ -554,6 +562,11 @@ export class VoiceClient {
     const to = sfu ? `sfu:${sfu.slice(0, 8)}` : 'mesh';
     console.log('[voice] topology', from, '→', to);
     this.sfuPubkey = sfu;
+    try {
+      this.events.onTopologyChange?.(sfu);
+    } catch (err) {
+      console.warn('[voice] onTopologyChange handler threw', err);
+    }
   }
 
   private openPeer(remotePubkey: string) {

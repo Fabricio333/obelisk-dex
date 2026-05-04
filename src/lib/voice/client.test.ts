@@ -343,6 +343,56 @@ describe('VoiceClient first-sighting beacon refresh', () => {
   });
 });
 
+describe('VoiceClient onTopologyChange', () => {
+  const SFU = 'f'.repeat(64);
+
+  it('fires with the SFU pubkey when an SFU beacon enters the roster', async () => {
+    const onTopologyChange = vi.fn();
+    const client = new VoiceClient('ch1', {
+      members: [SELF, PEER1],
+      events: { onTopologyChange },
+    });
+    await client.join();
+
+    // Roster with a regular peer — no topology change.
+    transportFake.fireRoster([presence(PEER1)]);
+    await flushMicrotasks(5);
+    expect(onTopologyChange).not.toHaveBeenCalled();
+
+    // Roster now includes an SFU beacon → topology flips to sfu:<pubkey>.
+    const sfuPresence: VoicePresence = {
+      pubkey: SFU, channelId: 'ch1', createdAt: 2, expiresAt: 9999999999,
+      connectedTo: [], videoTracks: [], isSfu: true,
+    };
+    transportFake.fireRoster([presence(PEER1), sfuPresence]);
+    await flushMicrotasks(5);
+    expect(onTopologyChange).toHaveBeenCalledWith(SFU);
+    await client.leave();
+  });
+
+  it('fires null when the SFU beacon leaves the roster (back to mesh)', async () => {
+    const onTopologyChange = vi.fn();
+    const client = new VoiceClient('ch1', {
+      members: [SELF, PEER1],
+      events: { onTopologyChange },
+    });
+    await client.join();
+    const sfuPresence: VoicePresence = {
+      pubkey: SFU, channelId: 'ch1', createdAt: 1, expiresAt: 9999999999,
+      connectedTo: [], videoTracks: [], isSfu: true,
+    };
+    transportFake.fireRoster([presence(PEER1), sfuPresence]);
+    await flushMicrotasks(5);
+    onTopologyChange.mockClear();
+
+    // SFU beacon expires / disappears → topology flips back to mesh.
+    transportFake.fireRoster([presence(PEER1)]);
+    await flushMicrotasks(5);
+    expect(onTopologyChange).toHaveBeenCalledWith(null);
+    await client.leave();
+  });
+});
+
 describe('VoiceClient capacity cap', () => {
   it('caps audio mesh participants at 8', async () => {
     // 10 candidates; 8-person audio cap + self trims to <= 7 others.
