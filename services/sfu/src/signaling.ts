@@ -104,8 +104,11 @@ export function subscribeSfuSignals(
       since,
     },
     (ev: Event) => {
+      const targets: string[] = [];
+      for (const t of ev.tags) {
+        if (t[0] === 'p' && typeof t[1] === 'string') targets.push(t[1]);
+      }
       if (ev.pubkey === selfPubkey) return;
-      const targets = ev.tags.filter((t) => t[0] === 'p').map((t) => t[1]);
       if (targets.length > 0 && !targets.includes(selfPubkey)) return;
       try {
         const payload = JSON.parse(ev.content) as VoiceSignalPayload;

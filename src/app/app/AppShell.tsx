@@ -2013,7 +2013,7 @@ function ChatPanel({
             />
           );
         }
-        if (group?.kind === 'voice') {
+        if (group?.kind === 'voice' || group?.kind === 'voice-sfu') {
           return (
             <VoiceRoom
               channelId={groupId}
@@ -2666,7 +2666,7 @@ function ChannelSettingsModal({ group, onClose }: { group: JsGroup; onClose: () 
   const [banner, setBanner] = useState(group.banner ?? '');
   const [isPublic, setIsPublic] = useState(group.isPublic);
   const [isOpen, setIsOpen] = useState(group.isOpen);
-  const [channelKind, setChannelKind] = useState<'text' | 'voice' | 'forum'>(group.kind);
+  const [channelKind, setChannelKind] = useState<'text' | 'voice' | 'voice-sfu' | 'forum'>(group.kind);
   const [savingMeta, setSavingMeta] = useState(false);
   const [metaErr, setMetaErr] = useState<string | null>(null);
   const [uploading, setUploading] = useState<null | 'icon' | 'banner'>(null);
@@ -2845,7 +2845,7 @@ function ChannelSettingsModal({ group, onClose }: { group: JsGroup; onClose: () 
             {/* Channel type --------------------------------------------- */}
             <section className="space-y-3">
               <SectionHeader title="Channel type" />
-              <div className="grid gap-2 sm:grid-cols-3">
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
                 <ToggleCard
                   active={channelKind === 'text'}
                   onClick={() => setChannelKind('text')}
@@ -2858,7 +2858,14 @@ function ChannelSettingsModal({ group, onClose }: { group: JsGroup; onClose: () 
                   onClick={() => setChannelKind('voice')}
                   icon="🎙️"
                   title="Voice / Video"
-                  subtitle="P2P call, up to 4 people"
+                  subtitle="P2P mesh, up to 8 people"
+                />
+                <ToggleCard
+                  active={channelKind === 'voice-sfu'}
+                  onClick={() => setChannelKind('voice-sfu')}
+                  icon="📡"
+                  title="Big-room voice"
+                  subtitle="SFU-routed, up to 50 people"
                 />
                 <ToggleCard
                   active={channelKind === 'forum'}
@@ -2872,6 +2879,15 @@ function ChannelSettingsModal({ group, onClose }: { group: JsGroup; onClose: () 
                 <p className="text-[11px] text-lc-muted">
                   Adds a <code className="text-lc-white/80">[&quot;t&quot;,&quot;voice&quot;]</code> tag. Members open{' '}
                   <code className="text-lc-white/80">/voice/{group.id.slice(0, 8)}…</code> to join.
+                </p>
+              )}
+              {channelKind === 'voice-sfu' && (
+                <p className="text-[11px] text-lc-muted">
+                  Adds a <code className="text-lc-white/80">[&quot;t&quot;,&quot;voice-sfu&quot;]</code> tag.
+                  Same join surface as voice, but the channel signals to operators &ldquo;expect a big
+                  room&rdquo;. An authorized SFU joins and forwards everyone&rsquo;s media so the room scales
+                  past the 8-peer mesh ceiling. See{' '}
+                  <code className="text-lc-white/80">docs/sfu-system.md</code>.
                 </p>
               )}
               {channelKind === 'forum' && (

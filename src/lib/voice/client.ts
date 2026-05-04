@@ -72,7 +72,18 @@ const MAX_VIDEO_SLOTS = 4;
 const BEACON_REFRESH_DEBOUNCE_MS = 250;
 
 export interface RemoteTrack {
+  /**
+   * Logical origin — whose participant tile this track renders in. In
+   * mesh, this equals the RTC remote. In SFU mode, it's the participant
+   * the SFU is forwarding from (set by `trackInfo.originPubkey`).
+   */
   pubkey: string;
+  /**
+   * The RTC remote that delivered this track over its PC. Same as
+   * `pubkey` in mesh; the SFU's pubkey in SFU mode. Used by teardown
+   * to clean up forwarded tracks when the underlying PC drops.
+   */
+  viaPubkey: string;
   trackId: string;
   kind: VoiceTrackKind;
   stream: MediaStream;
@@ -126,6 +137,30 @@ export class VoiceClient {
   private peers = new Map<string, Peer>();
   private remoteTracks = new Map<string, RemoteTrack>(); // key: trackId
   private rosterPubkeys: string[] = [];
+  /**
+   * SFU mode marker. Set when any beacon in `currentRoster` carries the
+   * `["sfu","1"]` topology tag; cleared otherwise. While set, the dial
+   * loop opens at most ONE PC (to this pubkey) instead of meshing across
+   * every other participant. See `setSfuMode` and docs/sfu-system.md §5.
+   */
+  private sfuPubkey: string | null = null;
+  /**
+   * Pubkeys that have published a beacon with `["sfu","1"]` for this
+   * channel. SFUs are infrastructure, not participants — they should be
+   * trusted through the membership filter without operators having to
+   * manually add the SFU's pubkey to every channel's NIP-29 member list.
+   * The SFU's signed beacon is the credential; the SFU's own allow-list
+   * (config-side) gates who can actually start calls on it.
+   *
+   * Refreshed from `currentRoster` on every snapshot — when the SFU's
+   * beacon expires, its pubkey leaves this set on the next sweep.
+   *
+   * Trust caveat: a malicious actor could publish a beacon with
+   * `["sfu","1"]` to claim SFU status. The hardening pair is the SFU's
+   * kind 31314 active-call event (only published when an authorized host
+   * actually started a call); v0 trusts the beacon flag alone.
+   */
+  private knownSfuPubkeys = new Set<string>();
   /**
    * Pubkeys we currently have RTCPeerConnections in `connected` state with.
    * Drives the `connectedTo` field of our own beacon — every other peer who
@@ -215,6 +250,15 @@ export class VoiceClient {
   isJoined(): boolean {
     return this.joined;
   }
+  /**
+   * Currently-active SFU pubkey for this channel, or null in mesh mode.
+   * UI uses this to render an "SFU mode" badge or hide the participant
+   * count from including the SFU. Updated whenever the roster snapshot
+   * gains/loses a beacon with `["sfu","1"]`.
+   */
+  getSfuPubkey(): string | null {
+    return this.sfuPubkey;
+  }
 
   /**
    * Toggle the open-room flag at runtime. Used when the channel's kind
@@ -261,6 +305,11 @@ export class VoiceClient {
   }
 
   isMember(pubkey: string): boolean {
+    // SFUs are pseudo-members: their signed beacon is the credential.
+    // This avoids forcing operators to add every SFU they want to use
+    // to every channel's NIP-29 member list. Filter is the same on the
+    // signaling path so the SFU's offers/answers/ICE aren't dropped.
+    if (this.knownSfuPubkeys.has(pubkey)) return true;
     return this.openRoom || this.members.has(pubkey) || this.admins.has(pubkey);
   }
 
@@ -301,6 +350,12 @@ export class VoiceClient {
       // Snapshot the live roster so the video-slot computation can see
       // every other peer's `videoTracks` claim alongside our own state.
       this.currentRoster = roster;
+      // Refresh known-SFU set BEFORE the membership filter so SFU
+      // beacons survive `isMember` even when the SFU isn't in the
+      // channel's NIP-29 member list. Auto-trust is intentional —
+      // operators shouldn't have to babysit the member list every
+      // time they want to spin up an SFU.
+      this.knownSfuPubkeys = new Set(roster.filter((r) => r.isSfu).map((r) => r.pubkey));
       // Compute the transitive participant set first — including peers we
       // only know about from someone else's `connectedTo` p-tags — then
       // filter by membership and hand to handleRoster for cap+open logic.
@@ -409,6 +464,14 @@ export class VoiceClient {
   // ── Roster + peer management ───────────────────────────────────────────
 
   private handleRoster(pubkeys: string[]) {
+    // Topology check first — if any beacon carries `["sfu","1"]`, switch
+    // to SFU mode (or out of it). The mode informs the rest of this
+    // function's wanted/visible logic.
+    const sfuFromRoster = this.currentRoster.find((r) => r.isSfu)?.pubkey ?? null;
+    if (sfuFromRoster !== this.sfuPubkey) {
+      this.setSfuMode(sfuFromRoster);
+    }
+
     const others = pubkeys.filter((p) => p !== this.selfPubkey);
 
     // First-sighting rebroadcast: if any pubkey in this snapshot is new to
@@ -426,38 +489,71 @@ export class VoiceClient {
     }
     if (sawNew) this.scheduleBeaconRefresh();
 
-    // Hard cap: if more than MAX_PARTICIPANTS would be present and we're
-    // not in the leading slice, deterministically (lex) trim the tail so
-    // every client agrees on the same set of cap-violators.
-    if (others.length + 1 > MAX_PARTICIPANTS) {
-      others.sort();
-      others.splice(MAX_PARTICIPANTS - 1);
+    // The SFU is infrastructure, not a participant — don't render its tile,
+    // don't count it against MAX_PARTICIPANTS.
+    const visible = this.sfuPubkey
+      ? others.filter((p) => p !== this.sfuPubkey)
+      : others;
+
+    // Hard cap (mesh only): if more than MAX_PARTICIPANTS would be present
+    // and we're not in the leading slice, deterministically (lex) trim the
+    // tail so every client agrees on the same set of cap-violators. SFU
+    // mode is exempt — that's the whole point of SFU.
+    if (!this.sfuPubkey && visible.length + 1 > MAX_PARTICIPANTS) {
+      visible.sort();
+      visible.splice(MAX_PARTICIPANTS - 1);
     }
 
     // Union of roster pubkeys + already-open peers. Some peers are
     // discovered via incoming signaling when relays don't deliver beacons
     // symmetrically — keeping them in the UI list prevents them from
-    // disappearing mid-call.
-    const union = new Set(others);
-    for (const pk of this.peers.keys()) union.add(pk);
+    // disappearing mid-call. The SFU is excluded from the UI list.
+    const union = new Set(visible);
+    for (const pk of this.peers.keys()) {
+      if (pk !== this.sfuPubkey) union.add(pk);
+    }
     this.rosterPubkeys = Array.from(union);
     this.events.onParticipantsChange?.([...this.rosterPubkeys]);
 
-    // Open peer connections for every wanted pubkey we don't already have.
-    // Do NOT close existing peers just because they're missing from this
-    // snapshot — beacon delivery is best-effort. Cleanup happens on
-    // explicit bye / RTC failure / cap-overflow.
-    const wanted = new Set(others);
+    // Wanted RTC connections.
+    //  - SFU mode: only the SFU. Existing mesh peers are torn down.
+    //  - Mesh:     every visible participant. Best-effort; we do NOT close
+    //              peers just because they're missing from this snapshot.
+    const wanted = new Set<string>();
+    if (this.sfuPubkey) {
+      wanted.add(this.sfuPubkey);
+      for (const pk of Array.from(this.peers.keys())) {
+        if (!wanted.has(pk)) this.tearDownPeer(pk);
+      }
+    } else {
+      for (const p of visible) wanted.add(p);
+    }
+
     for (const pk of wanted) {
       if (!this.peers.has(pk)) this.openPeer(pk);
     }
-    // Cap-overflow eviction: trim peers outside the leading slice.
-    if (this.peers.size + 1 > MAX_PARTICIPANTS) {
+    // Cap-overflow eviction (mesh only).
+    if (!this.sfuPubkey && this.peers.size + 1 > MAX_PARTICIPANTS) {
       const keep = new Set(Array.from(this.peers.keys()).sort().slice(0, MAX_PARTICIPANTS - 1));
       for (const pk of Array.from(this.peers.keys())) {
         if (!keep.has(pk)) this.tearDownPeer(pk);
       }
     }
+  }
+
+  /**
+   * Switch between mesh and SFU mode, or between SFUs. Idempotent — a
+   * no-op if already in the requested state. The actual peer reconciliation
+   * (open the new peer, tear down the old) is done by `handleRoster`'s
+   * wanted/peers diff loop, since `handleRoster` always runs immediately
+   * after this method via the same roster callback.
+   */
+  private setSfuMode(sfu: string | null): void {
+    if (this.sfuPubkey === sfu) return;
+    const from = this.sfuPubkey ? `sfu:${this.sfuPubkey.slice(0, 8)}` : 'mesh';
+    const to = sfu ? `sfu:${sfu.slice(0, 8)}` : 'mesh';
+    console.log('[voice] topology', from, '→', to);
+    this.sfuPubkey = sfu;
   }
 
   private openPeer(remotePubkey: string) {
@@ -474,19 +570,28 @@ export class VoiceClient {
       sessionId: this.sessionId,
       send: (payload) => sendSignal(this.channelId, remotePubkey, payload),
       events: {
-        onRemoteTrack: (track, stream, kind) => {
+        onRemoteTrack: (track, stream, kind, originPubkey) => {
           // Apply current deafen state to brand-new audio arrivals so a peer
           // who joins after we deafened doesn't suddenly become audible.
           if (this.deafened && (kind === 'audio' || kind === 'screen-audio')) {
             track.enabled = false;
           }
-          this.remoteTracks.set(track.id, { pubkey: remotePubkey, trackId: track.id, kind, stream });
-          // Speaking detection: attach an analyser to remote mic streams so
-          // the receiver's UI orb pulses on actual voice activity, not just
-          // mute state. screen-audio is excluded (game/music audio would
-          // continuously trip the threshold).
+          // In SFU mode `originPubkey` differs from `remotePubkey` (the SFU
+          // is the RTC peer; the participant who actually produced the
+          // media is the origin). Tile mapping uses the origin so the
+          // sound shows up on the right person's tile, not the SFU's.
+          const logicalPubkey = originPubkey ?? remotePubkey;
+          this.remoteTracks.set(track.id, {
+            pubkey: logicalPubkey,
+            viaPubkey: remotePubkey,
+            trackId: track.id,
+            kind,
+            stream,
+          });
+          // Speaking detection keyed by origin so SFU mode lights up the
+          // correct tile, not "the SFU is speaking" for everyone.
           if (kind === 'audio') {
-            this.attachSpeakingDetector(remotePubkey, stream);
+            this.attachSpeakingDetector(logicalPubkey, stream);
           }
           this.emitRemoteTracks();
         },
@@ -495,8 +600,9 @@ export class VoiceClient {
           this.remoteTracks.delete(trackId);
           // If the ended track was the peer's mic, stop their detector so
           // the orb doesn't strobe on stale RMS readings post-disconnect.
+          // Use the track's logical (origin) pubkey, not the RTC remote.
           if (removed?.kind === 'audio') {
-            this.detachSpeakingDetector(remotePubkey);
+            this.detachSpeakingDetector(removed.pubkey);
           }
           this.emitRemoteTracks();
         },
@@ -611,8 +717,21 @@ export class VoiceClient {
 
   private removeRemoteTracksFor(pubkey: string) {
     let changed = false;
+    const droppedAudioOrigins = new Set<string>();
+    // Match by `viaPubkey` (RTC remote) — when the SFU's PC drops, every
+    // forwarded track must clear regardless of which origin it carried.
+    // In mesh, viaPubkey === pubkey so the behavior is unchanged.
     for (const [id, t] of Array.from(this.remoteTracks.entries())) {
-      if (t.pubkey === pubkey) { this.remoteTracks.delete(id); changed = true; }
+      if (t.viaPubkey === pubkey) {
+        this.remoteTracks.delete(id);
+        if (t.kind === 'audio') droppedAudioOrigins.add(t.pubkey);
+        changed = true;
+      }
+    }
+    // Stop speaking detectors for every origin whose audio just disappeared,
+    // so the speaking orb on each affected tile clears immediately.
+    for (const origin of droppedAudioOrigins) {
+      this.detachSpeakingDetector(origin);
     }
     if (changed) this.emitRemoteTracks();
   }

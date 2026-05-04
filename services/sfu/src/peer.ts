@@ -30,6 +30,7 @@ import {
   RTCPeerConnection,
   type MediaStreamTrack,
   type RTCRtpSender,
+  type RTCRtpTransceiver,
   type RTCIceServer,
 } from 'werift';
 
@@ -65,6 +66,7 @@ interface ForwardedSender {
   trackId: string;
   trackKind: VoiceTrackKind;
   sender: RTCRtpSender;
+  transceiver: RTCRtpTransceiver;
 }
 
 export class Peer {
@@ -86,6 +88,20 @@ export class Peer {
 
   private wasConnected = false;
   private closed = false;
+  /**
+   * ICE-restart attempts done so far on this PC. Capped at
+   * `ICE_RESTART_LIMIT`; beyond that we close and let the browser
+   * redial. Mirrors the browser-side ladder in spirit (the browser
+   * does ICE restart → hard reset; we do ICE restart → close).
+   */
+  private iceRestartCount = 0;
+  /**
+   * Inbound track ids currently delivered by this peer over a recv-able
+   * transceiver. Used by the post-renegotiation diff to detect when a
+   * peer has dropped a sender (camera off, screen-share ended) so we
+   * can stop forwarding their now-dead track to other room members.
+   */
+  private inboundTrackIds = new Set<string>();
 
   constructor(opts: PeerOptions) {
     this.remotePubkey = opts.remotePubkey;
@@ -138,12 +154,20 @@ export class Peer {
       seq: this.outboundSeq++,
     });
 
-    const sender = this.pc.addTrack(track);
+    // Use addTransceiver (well-tested werift idiom) instead of addTrack
+    // (which is marked TODO in werift's source). `kind` here is the
+    // VOICE-LEVEL kind ('audio' / 'camera' / 'screen' / 'screen-audio');
+    // werift's transceiver wants the RAW media kind ('audio' / 'video').
+    const rawKind: 'audio' | 'video' =
+      kind === 'audio' || kind === 'screen-audio' ? 'audio' : 'video';
+    const transceiver = this.pc.addTransceiver(rawKind, { direction: 'sendonly' });
+    await transceiver.sender.replaceTrack(track);
     this.forwardedSenders.set(trackId, {
       originPubkey,
       trackId,
       trackKind: kind,
-      sender,
+      sender: transceiver.sender,
+      transceiver,
     });
     log.debug('forwarded track added', {
       to: this.remotePubkey.slice(0, 8),
@@ -151,9 +175,9 @@ export class Peer {
       kind,
     });
 
-    // werift triggers `onnegotiationneeded` after addTrack; our handler
-    // will create and send an offer. If we're already in the middle of
-    // one, makingOffer suppresses the duplicate.
+    // werift triggers `onnegotiationneeded` after addTransceiver; our
+    // handler creates and sends the offer. If a negotiation is already
+    // in flight, makingOffer suppresses the duplicate.
   }
 
   async stopForwardingTrack(originPubkey: Hex, trackId: string): Promise<void> {
@@ -162,9 +186,20 @@ export class Peer {
     if (!entry || entry.originPubkey !== originPubkey) return;
 
     try {
-      this.pc.removeTrack(entry.sender);
+      // Drop the underlying track. werift's removeTrack expects a sender
+      // returned from addTrack/addTransceiver; we kept the sender in the
+      // entry. If werift's removeTrack is incomplete for our path,
+      // replaceTrack(null) at least stops RTP egress.
+      await entry.sender.replaceTrack(null);
+      try {
+        this.pc.removeTrack(entry.sender);
+      } catch (innerErr) {
+        log.debug('pc.removeTrack threw (continuing)', {
+          err: (innerErr as Error).message,
+        });
+      }
     } catch (err) {
-      log.debug('removeTrack threw (peer likely closed)', {
+      log.debug('replaceTrack(null) threw (peer likely closed)', {
         err: (err as Error).message,
       });
     }
@@ -225,10 +260,13 @@ export class Peer {
     } catch (err) {
       log.debug('pc.close threw (ignored)', { err: (err as Error).message });
     }
-    if (this.wasConnected) {
-      this.wasConnected = false;
-      this.events.onDisconnected();
-    }
+    // Fire onDisconnected unconditionally — Room uses this callback to
+    // remove the peer from its `peers` map. If we only fired on the
+    // connected→disconnected edge, a peer that was constructed but never
+    // reached 'connected' (e.g. closed by `requestReset`) would stay in
+    // the map indefinitely and silently swallow subsequent offers.
+    this.wasConnected = false;
+    this.events.onDisconnected();
     log.info('peer closed', { remote: this.remotePubkey.slice(0, 8) });
   }
 
@@ -265,31 +303,74 @@ export class Peer {
       if (!track) return;
       const tid = trackIdOf(track);
       const kind = this.remoteTrackKinds.get(tid) ?? fallbackKind(track.kind as 'audio' | 'video');
+      this.inboundTrackIds.add(tid);
       log.info('inbound track', {
         from: this.remotePubkey.slice(0, 8),
         trackId: tid,
         kind,
       });
       this.events.onTrack(track, kind);
-      // Track-end detection isn't exposed on werift's MediaStreamTrack
-      // directly; tracks are removed when the peer disconnects. v0
-      // limitation — see file header.
+      // Mid-PC track ends are detected post-renegotiation in
+      // `diffInboundAfterRenegotiation`; tracks also get cleared when the
+      // whole peer disconnects (handled by Room.dropPeer).
     });
 
     this.pc.connectionStateChange.subscribe((state) => {
       log.debug('connection state', { remote: this.remotePubkey.slice(0, 8), state });
-      if (state === 'connected' && !this.wasConnected) {
-        this.wasConnected = true;
-        this.events.onConnected();
-      } else if ((state === 'failed' || state === 'closed' || state === 'disconnected') && this.wasConnected) {
-        this.wasConnected = false;
-        this.events.onDisconnected();
+      if (state === 'connected') {
+        // Successful (re)connect resets the restart counter so a future
+        // hiccup gets a fresh budget.
+        this.iceRestartCount = 0;
+        if (!this.wasConnected) {
+          this.wasConnected = true;
+          this.events.onConnected();
+        }
+        return;
+      }
+      if (state === 'failed' || state === 'closed' || state === 'disconnected') {
+        if (this.wasConnected) {
+          this.wasConnected = false;
+          this.events.onDisconnected();
+        }
         if (state === 'failed') {
-          log.info('peer failed — closing for redial', { remote: this.remotePubkey.slice(0, 8) });
-          this.close();
+          this.escalateOnFailed();
         }
       }
     });
+  }
+
+  /**
+   * Reconnect ladder: try ICE restart up to `ICE_RESTART_LIMIT` times,
+   * then close. werift's `restartIce()` flips the local ICE credentials
+   * and triggers a fresh negotiationneeded; the browser's perfect-
+   * negotiation handles the resulting offer. Closing on exhaustion lets
+   * the browser-side reconnect ladder drive a full rebuild.
+   */
+  private escalateOnFailed(): void {
+    if (this.closed) return;
+    const ICE_RESTART_LIMIT = 3;
+    if (this.iceRestartCount < ICE_RESTART_LIMIT) {
+      this.iceRestartCount++;
+      log.info('peer failed — ICE restart', {
+        remote: this.remotePubkey.slice(0, 8),
+        attempt: this.iceRestartCount,
+        limit: ICE_RESTART_LIMIT,
+      });
+      try {
+        this.pc.restartIce();
+      } catch (err) {
+        log.warn('restartIce threw', {
+          remote: this.remotePubkey.slice(0, 8),
+          err: (err as Error).message,
+        });
+        this.close();
+      }
+      return;
+    }
+    log.info('peer failed — restart budget exhausted, closing for redial', {
+      remote: this.remotePubkey.slice(0, 8),
+    });
+    this.close();
   }
 
   private async makeOffer(): Promise<void> {
@@ -336,6 +417,11 @@ export class Peer {
     }
 
     await this.pc.setRemoteDescription({ type: 'offer', sdp: payload.sdp });
+    // Detect tracks the remote stopped sending in this renegotiation
+    // (camera-off, screen-stop). Run AFTER setRemoteDescription so the
+    // transceivers reflect the new direction set, but BEFORE we publish
+    // the answer so the room is in sync when the next forwardTrack fires.
+    this.diffInboundAfterRenegotiation();
     await this.pc.setLocalDescription(); // produces answer
     const answerSdp = this.pc.localDescription?.sdp;
     if (!answerSdp) {
@@ -348,6 +434,50 @@ export class Peer {
       sessionId: this.sessionId,
       seq: this.outboundSeq++,
     });
+  }
+
+  /**
+   * Compare the post-renegotiation transceiver set against tracks we
+   * believed were live and fire `onTrackEnded` for any that the peer
+   * stopped sending. werift exposes `transceiver.currentDirection` as
+   * the last-negotiated direction — a transceiver that flipped to
+   * 'inactive' or 'sendonly' (from our PoV the peer stopped sending)
+   * means that track is gone.
+   *
+   * We can't always rely on `track.stopped` because werift sometimes
+   * keeps the receiver track object alive across renegotiations.
+   * Direction is the spec-compliant signal.
+   */
+  private diffInboundAfterRenegotiation(): void {
+    if (this.inboundTrackIds.size === 0) return;
+    const stillRecv = new Set<string>();
+    try {
+      for (const tx of this.pc.getTransceivers()) {
+        const dir = tx.currentDirection ?? tx.direction;
+        if (dir !== 'recvonly' && dir !== 'sendrecv') continue;
+        const t = tx.receiver?.track;
+        if (!t) continue;
+        const tid = trackIdOf(t);
+        stillRecv.add(tid);
+      }
+    } catch (err) {
+      // werift API surface drifts across versions; fail open rather than
+      // leaving the room in a stuck state if we can't introspect.
+      log.debug('transceiver diff threw — skipping', {
+        err: (err as Error).message,
+      });
+      return;
+    }
+    for (const tid of Array.from(this.inboundTrackIds)) {
+      if (!stillRecv.has(tid)) {
+        this.inboundTrackIds.delete(tid);
+        log.info('inbound track ended via renegotiation', {
+          from: this.remotePubkey.slice(0, 8),
+          trackId: tid,
+        });
+        this.events.onTrackEnded(tid);
+      }
+    }
   }
 
   private async handleAnswer(payload: VoiceSignalPayload): Promise<void> {

@@ -150,8 +150,8 @@ describe('transitiveParticipants', () => {
   it('unions publishers with their connectedTo lists', () => {
     const now = Math.floor(Date.now() / 1000);
     const result = transitiveParticipants([
-      { pubkey: 'A', channelId: 'ch1', createdAt: now, expiresAt: now + 30, connectedTo: ['B', 'C'], videoTracks: [] },
-      { pubkey: 'D', channelId: 'ch1', createdAt: now, expiresAt: now + 30, connectedTo: ['E'], videoTracks: [] },
+      { pubkey: 'A', channelId: 'ch1', createdAt: now, expiresAt: now + 30, connectedTo: ['B', 'C'], videoTracks: [], isSfu: false },
+      { pubkey: 'D', channelId: 'ch1', createdAt: now, expiresAt: now + 30, connectedTo: ['E'], videoTracks: [], isSfu: false },
     ]);
     expect(result.sort()).toEqual(['A', 'B', 'C', 'D', 'E']);
   });
@@ -162,9 +162,9 @@ describe('transitiveParticipants', () => {
     // E in the participant set so VoiceClient dials them.
     const now = Math.floor(Date.now() / 1000);
     const result = transitiveParticipants([
-      { pubkey: 'A', channelId: 'ch1', createdAt: now, expiresAt: now + 30, connectedTo: ['E'], videoTracks: [] },
-      { pubkey: 'B', channelId: 'ch1', createdAt: now, expiresAt: now + 30, connectedTo: [], videoTracks: [] },
-      { pubkey: 'C', channelId: 'ch1', createdAt: now, expiresAt: now + 30, connectedTo: [], videoTracks: [] },
+      { pubkey: 'A', channelId: 'ch1', createdAt: now, expiresAt: now + 30, connectedTo: ['E'], videoTracks: [], isSfu: false },
+      { pubkey: 'B', channelId: 'ch1', createdAt: now, expiresAt: now + 30, connectedTo: [], videoTracks: [], isSfu: false },
+      { pubkey: 'C', channelId: 'ch1', createdAt: now, expiresAt: now + 30, connectedTo: [], videoTracks: [], isSfu: false },
     ]);
     expect(result).toContain('E');
   });

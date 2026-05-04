@@ -91,6 +91,7 @@ const relayFake = vi.hoisted(() => {
         expiresAt: now + 30,
         connectedTo: Array.from(connectedTo),
         videoTracks: Array.from(videoTracks),
+        isSfu: false,
       });
       emitRosterToAll(channelId);
     },

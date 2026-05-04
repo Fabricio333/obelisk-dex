@@ -90,7 +90,7 @@ function presence(
   connectedTo: string[] = [],
   videoTracks: ('camera' | 'screen')[] = [],
 ): VoicePresence {
-  return { pubkey, channelId: 'ch1', createdAt: 1, expiresAt: 9999999999, connectedTo, videoTracks };
+  return { pubkey, channelId: 'ch1', createdAt: 1, expiresAt: 9999999999, connectedTo, videoTracks, isSfu: false };
 }
 
 describe('VoiceClient.join', () => {

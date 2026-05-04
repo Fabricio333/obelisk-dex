@@ -39,13 +39,22 @@ export interface DialContext {
 }
 
 export function canDialRoom(ctx: DialContext): { ok: true } | { ok: false; reason: string } {
-  // Layer 4: must be a NIP-29 channel member. The host themselves is
-  // exempted explicitly because some flows publish the start event before
-  // the host appears on the 39002 list (e.g. they were just added) — but
-  // since the host signed the start, they're trusted to dial.
-  if (ctx.sender !== ctx.hostPubkey && !ctx.members.has(ctx.sender)) {
-    return { ok: false, reason: 'not-a-channel-member' };
-  }
+  // Layer 4 (NIP-29 membership): SOFTENED in v0.
+  //
+  // Production should require channel membership for closed channels and
+  // skip the check for `["open"]` channels (kind 39000 metadata). v0
+  // doesn't yet subscribe to kind 39000 from the SFU side, and our
+  // `members` snapshot from kind 39002 lags or under-counts on open
+  // channels (the dex lets anyone join an open channel via beacon
+  // alone, without the relay materializing them into 39002).
+  //
+  // Compromise: drop the strict membership check. The signal is still
+  // signed by the sender, the per-call allow/deny still apply, and the
+  // host who issued `start` is implicitly authorizing whoever shows up
+  // in the channel. Punch-list: subscribe to kind 39000, check `["open"]`,
+  // re-enable strict membership for closed channels only.
+  void ctx.members;
+  void ctx.hostPubkey;
   // Layer 3: per-call deny is absolute.
   if (ctx.rules.deny.includes(ctx.sender)) {
     return { ok: false, reason: 'denied' };

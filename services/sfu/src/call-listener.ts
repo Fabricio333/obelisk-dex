@@ -45,10 +45,13 @@ export class CallListener {
   start(): void {
     if (this.unsub) return;
     const since = Math.floor(Date.now() / 1000) - 60;
+    // Some relays don't index `#p` for ephemeral kinds (same caveat as
+    // mesh kind 25050 — see src/lib/voice/transport.ts). Subscribe to
+    // every kind 25052 and gate by p-tag in `handle()`. Volume is low
+    // (only operator-issued control events ever land in this kind).
     this.unsub = this.relay.subscribe(
       {
         kinds: [KIND_SFU_CONTROL],
-        '#p': [this.relay.pubkey],
         since,
       },
       (ev) => this.handle(ev),
@@ -62,6 +65,13 @@ export class CallListener {
   }
 
   private handle(ev: Event): void {
+    // Gate by p-tag — we subscribe broadly to work around relays that
+    // don't index `#p` on ephemeral kinds.
+    const targetedAtUs = ev.tags.some(
+      (t) => t[0] === 'p' && t[1] === this.relay.pubkey,
+    );
+    if (!targetedAtUs) return;
+
     // Defensive: SimplePool already verifies sigs but we check the tag set.
     const channelTag = ev.tags.find((t) => t[0] === 'e')?.[1];
     if (!channelTag) {

@@ -142,6 +142,10 @@ export async function subscribeRoster(
       const videoTracks = ev.tags
         .filter((t) => t[0] === 'v' && (t[1] === 'camera' || t[1] === 'screen'))
         .map((t) => t[1] as VideoSlotKind);
+      // SFU advertisements carry `["sfu","1"]` on every beacon; mesh peers
+      // never set it. The presence/absence is the topology marker the
+      // VoiceClient uses to switch dial behavior — see `setSfuMode`.
+      const isSfu = ev.tags.some((t) => t[0] === 'sfu' && t[1] === '1');
       latest.set(ev.pubkey, {
         pubkey: ev.pubkey,
         channelId,
@@ -149,6 +153,7 @@ export async function subscribeRoster(
         expiresAt,
         connectedTo,
         videoTracks,
+        isSfu,
       });
       emit();
     },

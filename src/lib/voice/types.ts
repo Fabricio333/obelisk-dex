@@ -38,9 +38,16 @@ export interface VoiceSignalPayload {
   sdp?: string;
   /** Batched ICE candidates for `type: 'ice'`. */
   candidates?: RTCIceCandidateInit[];
-  /** Out-of-band track-kind announcement so the receiver knows which slot a
-   *  track maps to before the actual `ontrack` fires. */
-  trackInfo?: { trackId: string; kind: VoiceTrackKind };
+  /**
+   * Out-of-band track-kind announcement so the receiver knows which slot a
+   * track maps to before the actual `ontrack` fires.
+   *
+   * `originPubkey` is set by the SFU when forwarding another participant's
+   * track — it tells the receiver "this audio came from Alice, not from
+   * me (the SFU)" so the UI tile mapping points at the right participant.
+   * Mesh peers omit it (the RTC remote IS the origin).
+   */
+  trackInfo?: { trackId: string; kind: VoiceTrackKind; originPubkey?: string };
   /** Receiver-driven cap: "please don't send me more than this". */
   qualityHint?: VoiceQualityHint;
   /** Random per-session id so a peer who left and rejoined isn't confused
@@ -69,6 +76,14 @@ export interface VoicePresence {
    * to dial B. Empty when the publisher has no successful connections yet.
    */
   connectedTo: readonly string[];
+  /**
+   * `["sfu","1"]` tag on the beacon — set only by an SFU service announcing
+   * itself as a forwarding endpoint for this channel. When any beacon in
+   * the roster carries this flag, the local client switches into SFU mode:
+   * one PC to that pubkey instead of N PCs to every participant. See
+   * docs/sfu-system.md §3.4.
+   */
+  isSfu: boolean;
   /**
    * Outbound video tracks the publisher is currently sending (camera and/or
    * screen-share). Drives the room-wide video-slot cap: every participant

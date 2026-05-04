@@ -23,13 +23,16 @@ export interface JsGroup {
   readonly parent: string | null;
   /**
    * Channel variant marker carried as a `["t",<kind>]` tag on kind 39000
-   * metadata. `'voice'` → see `src/lib/voice/`; `'forum'` → container channel
-   * whose "posts" are themselves child NIP-29 groups (each rendered as a
-   * normal text channel) — see `ForumView.tsx`. `'text'` is the default for
-   * channels with no `t` marker, so existing groups keep rendering as regular
-   * chat. The relay needs no special handling — the marker is just another tag.
+   * metadata. `'voice'` → small mesh call (see `src/lib/voice/`);
+   * `'voice-sfu'` → big-room call that prefers SFU routing (same UI surface
+   * as `'voice'`, but the channel signals to operators "expect ≥10 people,
+   * spin up an SFU"); `'forum'` → container channel whose "posts" are
+   * themselves child NIP-29 groups — see `ForumView.tsx`. `'text'` is the
+   * default for channels with no `t` marker, so existing groups keep
+   * rendering as regular chat. The relay needs no special handling — the
+   * marker is just another tag.
    */
-  readonly kind: 'text' | 'voice' | 'forum';
+  readonly kind: 'text' | 'voice' | 'voice-sfu' | 'forum';
 }
 
 export interface JsMessage {
@@ -267,7 +270,7 @@ export interface NostrBridge {
     isPublic?: boolean;
     isOpen?: boolean;
     /** When `'voice'` / `'forum'`, includes a `["t",<kind>]` marker on the kind 9002 metadata. See `src/lib/voice/` and ForumView. */
-    kind?: 'text' | 'voice' | 'forum';
+    kind?: 'text' | 'voice' | 'voice-sfu' | 'forum';
     /**
      * NIP-29 nesting: parent group id. When set, the relay records this
      * group as a child of `parent` and the bridge surfaces it via
@@ -286,7 +289,7 @@ export interface NostrBridge {
     isPublic?: boolean;
     isOpen?: boolean;
     /** Toggle a channel's variant. Adds or omits the `["t",<kind>]` marker on the kind 9002 metadata; the relay reflects it on kind 39000 like any other tag. */
-    kind?: 'text' | 'voice' | 'forum';
+    kind?: 'text' | 'voice' | 'voice-sfu' | 'forum';
     /** NIP-29 parent group id (for nesting / forum threads). */
     parent?: string;
   }): Promise<void>;

@@ -1322,7 +1322,7 @@ class BridgeImpl implements NostrBridge {
     banner?: string;
     isPublic?: boolean;
     isOpen?: boolean;
-    kind?: 'text' | 'voice' | 'forum';
+    kind?: 'text' | 'voice' | 'voice-sfu' | 'forum';
     parent?: string;
   }): Promise<string> {
     const groupId = opts.groupId ?? generateGroupId();
@@ -1433,7 +1433,7 @@ class BridgeImpl implements NostrBridge {
     banner?: string;
     isPublic?: boolean;
     isOpen?: boolean;
-    kind?: 'text' | 'voice' | 'forum';
+    kind?: 'text' | 'voice' | 'voice-sfu' | 'forum';
     parent?: string;
   }): Promise<void> {
     const tags: string[][] = [['h', opts.groupId]];
@@ -1449,6 +1449,7 @@ class BridgeImpl implements NostrBridge {
     // (kind: 'text') makes a previously-voice/forum channel revert to a
     // regular text channel.
     if (opts.kind === 'voice') tags.push(['t', 'voice']);
+    else if (opts.kind === 'voice-sfu') tags.push(['t', 'voice-sfu']);
     else if (opts.kind === 'forum') tags.push(['t', 'forum']);
     await this.signAndPublish({
       kind: KIND_GROUP_EDIT_METADATA,
@@ -2136,11 +2137,14 @@ class BridgeImpl implements NostrBridge {
     const isPublic = ev.tags.some((t) => t[0] === 'public');
     const isOpen = ev.tags.some((t) => t[0] === 'open');
     const parent = tag('parent') ?? null;
-    // `["t","voice"]` / `["t","forum"]` are the Obelisk channel-variant
-    // markers. Everything else defaults to `text` so existing groups keep
-    // working unchanged.
-    const isVoice = ev.tags.some((t) => t[0] === 't' && t[1] === 'voice');
-    const isForum = !isVoice && ev.tags.some((t) => t[0] === 't' && t[1] === 'forum');
+    // `["t","voice"]` / `["t","voice-sfu"]` / `["t","forum"]` are the
+    // Obelisk channel-variant markers. Everything else defaults to `text`
+    // so existing groups keep working unchanged. `voice-sfu` is checked
+    // before `voice` because it's the more specific marker — a channel
+    // tagged with both is "big-room voice".
+    const isVoiceSfu = ev.tags.some((t) => t[0] === 't' && t[1] === 'voice-sfu');
+    const isVoice = !isVoiceSfu && ev.tags.some((t) => t[0] === 't' && t[1] === 'voice');
+    const isForum = !isVoiceSfu && !isVoice && ev.tags.some((t) => t[0] === 't' && t[1] === 'forum');
     const next: JsGroup = {
       id: groupId,
       name: tag('name') ?? null,
@@ -2150,7 +2154,7 @@ class BridgeImpl implements NostrBridge {
       isPublic,
       isOpen,
       parent,
-      kind: isVoice ? 'voice' : isForum ? 'forum' : 'text',
+      kind: isVoiceSfu ? 'voice-sfu' : isVoice ? 'voice' : isForum ? 'forum' : 'text',
     };
     this.groups.update((prev) => {
       const filtered = prev.filter((g) => g.id !== groupId);

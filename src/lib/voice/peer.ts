@@ -76,7 +76,13 @@ const ICE_TRANSPORT_POLICY: RTCIceTransportPolicy =
   process.env.NEXT_PUBLIC_FORCE_RELAY === '1' ? 'relay' : 'all';
 
 export interface PeerEvents {
-  onRemoteTrack(track: MediaStreamTrack, stream: MediaStream, kind: VoiceTrackKind): void;
+  /**
+   * `originPubkey` is set when this RTC peer is forwarding a track that
+   * originated elsewhere (the SFU forwarding-pattern). Mesh peers omit it
+   * — for them the RTC remote IS the origin. The owner (`VoiceClient`)
+   * keys participant tiles by `originPubkey ?? remotePubkey`.
+   */
+  onRemoteTrack(track: MediaStreamTrack, stream: MediaStream, kind: VoiceTrackKind, originPubkey?: string): void;
   onRemoteTrackEnded(trackId: string): void;
   onConnectionStateChange(state: RTCPeerConnectionState): void;
   /** Fires when the underlying `pc` reaches `'connected'`. Used by the
@@ -113,6 +119,10 @@ export class Peer {
   private outboundSeq = 0;
   /** Track-id → kind, applied in `ontrack`. Sender announces via `trackInfo`. */
   private remoteTrackKinds = new Map<string, VoiceTrackKind>();
+  /** Track-id → origin pubkey, set when the SFU forwards a track. Same
+   *  trackInfo path as the kind map; populated only when `originPubkey`
+   *  was present on the inbound payload. */
+  private remoteTrackOrigins = new Map<string, string>();
   /** Senders we've added so we can replace/remove them when toggling cam/screen. */
   private localSenders = new Map<VoiceTrackKind, RTCRtpSender>();
   /** Tracks we've attached, kept here separately so we can re-attach them on
@@ -193,11 +203,14 @@ export class Peer {
       this.remoteStreams.set(ev.track.id, stream);
       const kind = this.remoteTrackKinds.get(ev.track.id)
         ?? (ev.track.kind === 'audio' ? 'audio' : 'camera');
-      console.log('[voice] ontrack', kind, 'from', this.remotePubkey.slice(0, 8));
+      const origin = this.remoteTrackOrigins.get(ev.track.id);
+      console.log('[voice] ontrack', kind, 'from', this.remotePubkey.slice(0, 8),
+        origin ? `origin=${origin.slice(0, 8)}` : '');
       ev.track.onended = () => {
         this.events.onRemoteTrackEnded(ev.track.id);
         this.remoteStreams.delete(ev.track.id);
         this.remoteTrackKinds.delete(ev.track.id);
+        this.remoteTrackOrigins.delete(ev.track.id);
       };
       // When the sender calls `pc.removeTrack(...)` (camera off, screen-share
       // ended, peer dropped without a clean bye), the receiver does NOT get
@@ -217,7 +230,7 @@ export class Peer {
           console.log('[voice] remote', kind, 'unmuted from', this.remotePubkey.slice(0, 8));
           // Re-emit the same track + stream — the React layer keys on
           // trackId, so this is an upsert not a duplicate.
-          this.events.onRemoteTrack(ev.track, stream, kind);
+          this.events.onRemoteTrack(ev.track, stream, kind, origin);
         };
       }
       this.events.onRemoteTrack(ev.track, stream, kind);
@@ -509,6 +522,9 @@ export class Peer {
 
     if (payload.trackInfo) {
       this.remoteTrackKinds.set(payload.trackInfo.trackId, payload.trackInfo.kind);
+      if (payload.trackInfo.originPubkey) {
+        this.remoteTrackOrigins.set(payload.trackInfo.trackId, payload.trackInfo.originPubkey);
+      }
     }
 
     try {
