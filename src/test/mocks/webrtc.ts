@@ -45,10 +45,19 @@ export class FakeMediaStreamTrack extends TinyEventTarget {
   readonly id: string = `track-${trackIdSeq++}`;
   enabled = true;
   readyState: 'live' | 'ended' = 'live';
+  /**
+   * Mirrors the real `MediaStreamTrack.muted` flag — flips to true when
+   * the sender stops feeding the track (e.g. `pc.removeTrack`) and back to
+   * false on resume. Only `mute` / `unmute` events surface this transition;
+   * `ended` does NOT fire in that scenario.
+   */
+  muted = false;
   readonly kind: 'audio' | 'video';
   /** Last constraints applied via applyConstraints. */
   appliedConstraints: MediaTrackConstraints | null = null;
   onended: (() => void) | null = null;
+  onmute: (() => void) | null = null;
+  onunmute: (() => void) | null = null;
 
   constructor(kind: 'audio' | 'video') {
     super();

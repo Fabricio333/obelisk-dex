@@ -219,6 +219,33 @@ describe('Peer requestReset handling', () => {
   });
 });
 
+describe('Peer hard-reset isolation', () => {
+  it('does NOT bubble the old PC\'s close upward — the owner should keep the Peer alive', async () => {
+    const onState = vi.fn();
+    const { peer } = makePeer({ polite: false, events: { onConnectionStateChange: onState } });
+    const initialPc = peer.pc as unknown as FakeRTCPeerConnection;
+    initialPc.forceState('connected');
+    await settle();
+    onState.mockClear();
+
+    // Drive the ladder all the way to a hard reset.
+    initialPc.forceState('failed');
+    await settle();
+    for (let i = 0; i <= ICE_RESTART_LIMIT; i++) {
+      vi.advanceTimersByTime(RECONNECT_DELAYS_MS[Math.min(i, RECONNECT_DELAYS_MS.length - 1)]);
+      await settle();
+      if (i < ICE_RESTART_LIMIT) initialPc.forceState('failed');
+    }
+
+    // The new PC is in place.
+    expect(peer.pc).not.toBe(initialPc);
+    // And the parent never saw a `closed` event from the silent teardown of
+    // the old PC — that's the regression: surfacing 'closed' here would
+    // make VoiceClient tear the Peer down and orphan the fresh PC.
+    expect(onState.mock.calls.find((c) => c[0] === 'closed')).toBeUndefined();
+  });
+});
+
 describe('Peer connection-edge events', () => {
   it('fires onConnectionEstablished once per transition into connected', async () => {
     const onEstablished = vi.fn();

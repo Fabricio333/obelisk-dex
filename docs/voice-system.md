@@ -19,7 +19,7 @@ Browser A ─── WebRTC (DTLS-SRTP) ───▶ Browser B
 - **Media is end-to-end** in the WebRTC sense — every track is wrapped in DTLS-SRTP between the two browsers. The relay never sees media. There is no third party in the media path to decrypt it.
 - **Signaling is plaintext signed events** today (kinds 20078 + 25050). A NIP-59 gift-wrap upgrade is planned — see [webrtc-p2p-nostr-signaling.md §9](webrtc-p2p-nostr-signaling.md). Until then, the relay can see who is in which voice channel and the SDP/ICE payloads of session setup. Media is unaffected.
 - **Transitive beacon discovery** — every presence beacon advertises the publisher's currently-connected peers as `p` tags. A fresh joiner whose relay drops some publishers' beacons still discovers them via the `p`-tag list of any beacon they DO receive. Mesh formation converges from any starting position, even with asymmetric beacon delivery.
-- **Reconnect ladder** on every peer: ICE restart up to 3× then hard reset (close + rebuild PC + re-attach senders). Polite side waits longer and emits `requestReset` so the impolite peer drives the rebuild without offer glare. Initial-handshake watchdog (15 s) catches PCs that never reach `'connected'`.
+- **Reconnect ladder** on every peer: ICE restart up to 3× then hard reset (close + rebuild PC + re-attach senders). Polite side waits longer and emits `requestReset` so the impolite peer drives the rebuild without offer glare. Initial-handshake watchdog (8 s) catches PCs that never reach `'connected'` quickly enough to keep the user in front of automatic recovery instead of refreshing.
 - **No TURN configured**. Public STUN only (Google + Cloudflare). Symmetric-NAT peers will fail to connect unless `NEXT_PUBLIC_TURN_URLS` is set.
 
 ## Files
@@ -156,7 +156,7 @@ The roster handler in `transport.ts` parses both `p` tags (transitive discovery)
 
 Result: even if relay X drops every beacon E publishes, every other client that received A's beacon — when A had connected to E — knows E is in the room and dials E directly. Mesh formation converges from any starting position with asymmetric beacon delivery.
 
-To minimize latency, beacons are republished **opportunistically** (debounced 250 ms) on every connection-state change OR local video toggle, so a successful connection / new video claim propagates within the next beacon hop, not after a full 15 s tick.
+To minimize latency, beacons are republished **opportunistically** (debounced 250 ms) on every connection-state change OR local video toggle OR first-time sighting of a new pubkey in the roster, so a successful connection / new video claim / fresh joiner propagates within the next beacon hop, not after a full 15 s tick. On `join()` the client also fires a front-loaded burst at 0.5 / 1.5 / 3.5 / 7 / 12 s so cold-started peers find each other before the steady-state cadence kicks in.
 
 ## What's not yet shipped
 

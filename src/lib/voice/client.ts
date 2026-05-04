@@ -35,6 +35,21 @@ import { SpeakingDetector, resumeSharedAudioContext } from './speaking-detector'
 
 const BEACON_INTERVAL_MS = 15_000;
 /**
+ * Aggressive beacon burst right after `join()`. NIP-29 voice beacons are
+ * ephemeral — relays don't backfill them — so a peer who joined a few
+ * seconds before us would otherwise be invisible until their next 15 s
+ * tick. Firing additional publishes in the first ~12 s collapses that
+ * worst-case discovery latency to a few seconds while keeping the
+ * total relay traffic bounded (six small events vs ~one event every
+ * 15 s in steady state).
+ *
+ * Time origin = right after the first `publishBeacon()` returns from
+ * `join()`. The schedule is intentionally front-loaded: each step is
+ * roughly 2× the previous so a slow NIP-42 AUTH has multiple chances
+ * to land a beacon before we settle into the steady-state cadence.
+ */
+const BEACON_BRINGUP_DELAYS_MS = [500, 1500, 3500, 7000, 12_000];
+/**
  * Audio-mesh cap. 8 participants × 7 outbound audio streams each = 56 PCs
  * worst-case room-wide; that's still inside what a typical home upstream
  * can carry at Opus 64–128 kbps per stream.
@@ -140,6 +155,19 @@ export class VoiceClient {
   private screenAudioTrack: MediaStreamTrack | null = null;
 
   private beaconTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Front-loaded extra beacon publishes scheduled at `join()` time. Held so
+   * `leave()` can cancel them — without this, an in-flight bring-up timer
+   * would publish a beacon for a channel we've already left.
+   */
+  private bringupTimers: ReturnType<typeof setTimeout>[] = [];
+  /**
+   * Pubkeys we've seen in any roster snapshot since join. Used to detect a
+   * NEW peer's first appearance, which schedules a beacon refresh so that
+   * peer learns about us within ~250 ms instead of waiting up to a full
+   * `BEACON_INTERVAL_MS` for our next periodic publish.
+   */
+  private seenRosterPubkeys = new Set<string>();
   private rosterUnsub: (() => void) | null = null;
   private signalsUnsub: (() => void) | null = null;
   private joined = false;
@@ -286,12 +314,15 @@ export class VoiceClient {
     });
 
     await this.publishBeacon();
-    // Re-emit a few times in the first ~5s so a peer who arrives just after
-    // us still sees our beacon even if their relay session doesn't backfill
-    // ephemeral events. Cheap insurance against relays that don't push
-    // already-stored ephemerals to fresh subscribers.
-    setTimeout(() => { void this.publishBeacon().catch(() => {}); }, 1500);
-    setTimeout(() => { void this.publishBeacon().catch(() => {}); }, 4000);
+    // Front-loaded burst — beacons are ephemeral so a peer whose relay
+    // session was still completing NIP-42 AUTH on our first beacon needs
+    // several more chances within the user's "is this stuck?" window
+    // before we let the 15 s steady-state cadence take over.
+    for (const delay of BEACON_BRINGUP_DELAYS_MS) {
+      this.bringupTimers.push(
+        setTimeout(() => { void this.publishBeacon().catch(() => {}); }, delay),
+      );
+    }
     this.beaconTimer = setInterval(() => {
       void this.publishBeacon().catch(() => {});
     }, BEACON_INTERVAL_MS);
@@ -308,6 +339,9 @@ export class VoiceClient {
       clearTimeout(this.beaconRefreshTimer);
       this.beaconRefreshTimer = null;
     }
+    for (const t of this.bringupTimers) clearTimeout(t);
+    this.bringupTimers.length = 0;
+    this.seenRosterPubkeys.clear();
     this.signalsUnsub?.();
     this.signalsUnsub = null;
     this.rosterUnsub?.();
@@ -376,6 +410,21 @@ export class VoiceClient {
 
   private handleRoster(pubkeys: string[]) {
     const others = pubkeys.filter((p) => p !== this.selfPubkey);
+
+    // First-sighting rebroadcast: if any pubkey in this snapshot is new to
+    // us, schedule a beacon refresh so that peer learns about us within
+    // ~250 ms instead of waiting up to a full BEACON_INTERVAL_MS for our
+    // next periodic publish. The debounce coalesces a flurry of new peers
+    // (e.g. cold-start where the first roster delivery contains the entire
+    // room) into a single extra publish.
+    let sawNew = false;
+    for (const pk of others) {
+      if (!this.seenRosterPubkeys.has(pk)) {
+        this.seenRosterPubkeys.add(pk);
+        sawNew = true;
+      }
+    }
+    if (sawNew) this.scheduleBeaconRefresh();
 
     // Hard cap: if more than MAX_PARTICIPANTS would be present and we're
     // not in the leading slice, deterministically (lex) trim the tail so

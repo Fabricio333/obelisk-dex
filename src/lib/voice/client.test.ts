@@ -271,6 +271,78 @@ describe('VoiceClient quality propagation', () => {
   });
 });
 
+describe('VoiceClient bring-up beacon burst', () => {
+  it('schedules extra publishes during the first ~12 s after join', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new VoiceClient('ch1', { members: [SELF] });
+      await client.join();
+      // join() awaits the very first beacon synchronously.
+      expect(transportFake.publishPresenceBeacon).toHaveBeenCalledTimes(1);
+
+      // Walk past every front-loaded delay; each must produce a publish.
+      for (const t of [500, 1500, 3500, 7000, 12_000]) {
+        vi.setSystemTime(t);
+        vi.advanceTimersByTime(t);
+        await flushMicrotasks(2);
+      }
+      // 1 (initial) + 5 (burst) = 6 calls before the first 15 s tick.
+      expect(transportFake.publishPresenceBeacon.mock.calls.length).toBeGreaterThanOrEqual(6);
+      await client.leave();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels pending bring-up timers on leave so they do not stray-publish', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new VoiceClient('ch1', { members: [SELF] });
+      await client.join();
+      const baseline = transportFake.publishPresenceBeacon.mock.calls.length;
+      await client.leave();
+      // Advance past every bring-up delay; nothing else should fire.
+      vi.advanceTimersByTime(20_000);
+      await flushMicrotasks(2);
+      expect(transportFake.publishPresenceBeacon.mock.calls.length).toBe(baseline);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('VoiceClient first-sighting beacon refresh', () => {
+  it('schedules an extra publish when a previously-unseen peer appears in the roster', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new VoiceClient('ch1', { members: [SELF, PEER1] });
+      await client.join();
+      // Drain the bring-up burst so the assertion focuses on the
+      // roster-driven refresh.
+      vi.advanceTimersByTime(15_000);
+      await flushMicrotasks(2);
+      const baseline = transportFake.publishPresenceBeacon.mock.calls.length;
+
+      // First time we see PEER1 → opportunistic publish (debounced 250 ms).
+      transportFake.fireRoster([presence(PEER1)]);
+      vi.advanceTimersByTime(300);
+      await flushMicrotasks(2);
+      expect(transportFake.publishPresenceBeacon.mock.calls.length).toBeGreaterThan(baseline);
+
+      // Re-firing the SAME roster shouldn't trigger another refresh — only
+      // brand-new pubkeys count as a sighting.
+      const after = transportFake.publishPresenceBeacon.mock.calls.length;
+      transportFake.fireRoster([presence(PEER1)]);
+      vi.advanceTimersByTime(300);
+      await flushMicrotasks(2);
+      expect(transportFake.publishPresenceBeacon.mock.calls.length).toBe(after);
+      await client.leave();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe('VoiceClient capacity cap', () => {
   it('caps audio mesh participants at 8', async () => {
     // 10 candidates; 8-person audio cap + self trims to <= 7 others.

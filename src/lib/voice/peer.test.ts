@@ -335,3 +335,53 @@ describe('Peer.close', () => {
     expect(sent).toHaveLength(0);
   });
 });
+
+describe('Peer remote-track mute / unmute', () => {
+  it('treats a video mute event as track-ended so the receiver drops the frozen frame', async () => {
+    const onRemoteTrack = vi.fn();
+    const onRemoteTrackEnded = vi.fn();
+    const { peer } = makePeer({ events: { onRemoteTrack, onRemoteTrackEnded } });
+    const pc = peer.pc as unknown as FakeRTCPeerConnection;
+
+    // Pretend the receiver got a video track via ontrack.
+    const vid = new FakeMediaStreamTrack('video');
+    const stream = { getTracks: () => [vid] } as unknown as MediaStream;
+    pc.ontrack?.({ track: vid, streams: [stream as unknown as never] } as never);
+
+    expect(onRemoteTrack).toHaveBeenCalledTimes(1);
+    expect(typeof vid.onmute).toBe('function');
+
+    // The sender turned their camera off → the receiver gets `mute`. We
+    // surface that as `onRemoteTrackEnded` so the React layer drops the
+    // stream entry (and the <video> falls back to the avatar tile).
+    vid.onmute?.();
+    expect(onRemoteTrackEnded).toHaveBeenCalledWith(vid.id);
+  });
+
+  it('re-emits onRemoteTrack on unmute so the tile recovers when the sender re-enables', async () => {
+    const onRemoteTrack = vi.fn();
+    const { peer } = makePeer({ events: { onRemoteTrack } });
+    const pc = peer.pc as unknown as FakeRTCPeerConnection;
+
+    const vid = new FakeMediaStreamTrack('video');
+    const stream = { getTracks: () => [vid] } as unknown as MediaStream;
+    pc.ontrack?.({ track: vid, streams: [stream as unknown as never] } as never);
+
+    vid.onmute?.();
+    onRemoteTrack.mockClear();
+    vid.onunmute?.();
+    expect(onRemoteTrack).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT install onmute / onunmute on remote audio tracks', async () => {
+    const { peer } = makePeer();
+    const pc = peer.pc as unknown as FakeRTCPeerConnection;
+    const audio = new FakeMediaStreamTrack('audio');
+    const stream = { getTracks: () => [audio] } as unknown as MediaStream;
+    pc.ontrack?.({ track: audio, streams: [stream as unknown as never] } as never);
+    // Audio mute = silent audio, which is fine. The speaking detector handles
+    // it; we don't want to drop the stream entry.
+    expect(audio.onmute).toBeNull();
+    expect(audio.onunmute).toBeNull();
+  });
+});

@@ -30,16 +30,21 @@ import { AUDIO_MAX_BITRATE } from './quality';
 // ── Reconnect schedule ───────────────────────────────────────────────────
 //
 // Start small so transient ICE hiccups (Wi-Fi roam, ~1–2 s) self-heal without
-// a visible gap, then back off so we don't hammer dead peers.
-export const RECONNECT_DELAYS_MS = [1500, 3000, 6000, 10000, 15000];
+// a visible gap, then back off so we don't hammer dead peers. The first
+// retry fires fast (1 s) so a single dropped offer/answer round-trip during
+// the initial handshake doesn't strand the user behind the watchdog.
+export const RECONNECT_DELAYS_MS = [1000, 2500, 5000, 10000, 15000];
 // Polite side waits longer because it's asking the remote to do a full PC
 // rebuild — we don't want to spam those requests.
-export const POLITE_RESET_DELAYS_MS = [8000, 12000, 20000];
+export const POLITE_RESET_DELAYS_MS = [6000, 10000, 16000];
 // After this many ICE restarts we escalate to a full PC recreate.
 export const ICE_RESTART_LIMIT = 3;
 // Max time the initial handshake is allowed to sit before we treat it as
-// wedged and trigger a fresh PC.
-export const INITIAL_CONNECT_TIMEOUT_MS = 15000;
+// wedged and trigger a fresh PC. Lowered from 15 s to 8 s — beyond ~8 s
+// the user perceives the channel as "stuck" and reflexively refreshes,
+// which is exactly what the reconnect ladder is meant to prevent. The
+// polite/impolite request-reset path picks up immediately at this mark.
+export const INITIAL_CONNECT_TIMEOUT_MS = 8000;
 
 /**
  * STUN-only configurations work on permissive NATs but fail on symmetric /
@@ -194,6 +199,27 @@ export class Peer {
         this.remoteStreams.delete(ev.track.id);
         this.remoteTrackKinds.delete(ev.track.id);
       };
+      // When the sender calls `pc.removeTrack(...)` (camera off, screen-share
+      // ended, peer dropped without a clean bye), the receiver does NOT get
+      // an `ended` event — only `mute`. Without handling it the <video>
+      // element keeps the last frame painted, so the UI looks like the peer
+      // is still presenting. Treat a video mute as "track gone for now": fire
+      // onRemoteTrackEnded so the React layer drops the stream entry. If the
+      // sender re-enables, `unmute` (or a fresh `ontrack`) re-adds it.
+      // Audio mute is intentionally ignored — silent audio is still valid
+      // playback state and the speaking detector handles silence on its own.
+      if (kind === 'camera' || kind === 'screen') {
+        ev.track.onmute = () => {
+          console.log('[voice] remote', kind, 'muted from', this.remotePubkey.slice(0, 8));
+          this.events.onRemoteTrackEnded(ev.track.id);
+        };
+        ev.track.onunmute = () => {
+          console.log('[voice] remote', kind, 'unmuted from', this.remotePubkey.slice(0, 8));
+          // Re-emit the same track + stream — the React layer keys on
+          // trackId, so this is an upsert not a duplicate.
+          this.events.onRemoteTrack(ev.track, stream, kind);
+        };
+      }
       this.events.onRemoteTrack(ev.track, stream, kind);
     };
 
@@ -331,6 +357,18 @@ export class Peer {
     if (this.closed) return;
     console.log('[voice] hard reset for', this.remotePubkey.slice(0, 8));
     if (this.statsMonitor) { this.statsMonitor.stop(); this.statsMonitor = null; }
+    // Detach the old PC's handlers BEFORE closing it. `pc.close()` fires
+    // `onconnectionstatechange('closed')` and the owner (`VoiceClient`)
+    // treats a closed state as "the ladder gave up" and tears the Peer
+    // down — which would orphan the brand-new PC we're about to install.
+    // Nulling the handlers first makes the close silent so the Peer keeps
+    // running with the fresh PC.
+    try {
+      this.pc.onconnectionstatechange = null;
+      this.pc.onicecandidate = null;
+      this.pc.ontrack = null;
+      this.pc.onnegotiationneeded = null;
+    } catch { /* ignore — old browsers may not allow null assignment */ }
     try { this.pc.close(); } catch { /* already closed */ }
     // localSenders refer to the old PC; clear them so re-add creates new ones.
     this.localSenders.clear();
