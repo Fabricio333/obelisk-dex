@@ -37,6 +37,7 @@ import type { Event as NostrEvent, Filter } from 'nostr-tools';
 
 import { getBridge, getBridgeImpl } from '@/lib/nostr-bridge/client';
 import { KIND_SFU_ADVERTISE, KIND_SFU_CONTROL } from '@/lib/nip-kinds';
+import { resolveSfuPin } from './sfu-pin';
 
 /** Trusted-author relay used as a hard fallback when no advertisement is
  *  cached yet (matches services/sfu defaults). */
@@ -142,12 +143,33 @@ async function ensureAdvertisementSub(): Promise<void> {
  * Operators run one SFU per channel cluster; multi-SFU selection is a
  * post-v0 concern.
  */
-export async function pickSfu(): Promise<SfuAdvertisement | null> {
-  // Build-time override: when the operator pins a single SFU there's no
-  // need to round-trip kind 31313 discovery through a relay. Skips a
-  // failure mode where the chosen relay (e.g. NIP-29-only) refuses to
-  // store kind 31313 — the SFU's publish acks but no subscriber ever
-  // sees it, so `pickSfu` returns null and the UI shows "SFU unavailable".
+export async function pickSfu(channelId?: string): Promise<SfuAdvertisement | null> {
+  // 1) Per-channel pin (kind 30078) — what the channel admin chose. This
+  //    is the path we want to be the rule, not the exception: any operator
+  //    can run their own SFU and bind it to their channel without touching
+  //    the dex build. Falls through if no pin is set yet for this channel.
+  if (channelId) {
+    const channelPin = await resolveSfuPin(channelId);
+    if (channelPin) {
+      return {
+        pubkey: channelPin.pubkey,
+        url: channelPin.url,
+        region: null,
+        cap: null,
+        trustedRelays: channelPin.trustedRelays,
+        generalRelays: channelPin.trustedRelays,
+        createdAt: channelPin.createdAt,
+      };
+    }
+  }
+
+  // 2) Build-time override: when the operator pins a single SFU via env
+  //    vars there's no need to round-trip kind 31313 discovery through a
+  //    relay. Skips a failure mode where the chosen relay (e.g. NIP-29-only)
+  //    refuses to store kind 31313 — the SFU's publish acks but no
+  //    subscriber ever sees it, so `pickSfu` returns null and the UI
+  //    shows "SFU unavailable". With per-channel pins live, this layer
+  //    is just a safety net for unconfigured channels.
   const pinnedPubkey = process.env.NEXT_PUBLIC_SFU_PUBKEY;
   const pinnedUrl = process.env.NEXT_PUBLIC_SFU_URL;
   if (pinnedPubkey && /^[0-9a-f]{64}$/i.test(pinnedPubkey)) {
@@ -256,7 +278,7 @@ export async function ensureSfuRoomStarted(
   params: SfuStartParams = {},
   options: { force?: boolean } = {},
 ): Promise<string | null> {
-  const sfu = await pickSfu();
+  const sfu = await pickSfu(channelId);
   if (!sfu) return null;
   const ok = await publishSfuStart(channelId, sfu.pubkey, {
     trustedRelays: sfu.trustedRelays,

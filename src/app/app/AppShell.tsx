@@ -2695,6 +2695,34 @@ function ChannelSettingsModal({ group, onClose }: { group: JsGroup; onClose: () 
   const admins = useAdmins(group.id);
   const adminSet = useMemo(() => new Set(admins), [admins]);
 
+  // Per-channel SFU pin (kind 30078) — only relevant when this channel is
+  // a voice-sfu kind. Prefilled from any existing pin first, falling back
+  // to env-var suggestions so first-time setups have something sensible.
+  const [sfuPubkey, setSfuPubkey] = useState('');
+  const [sfuUrl, setSfuUrl] = useState('');
+  const [sfuTrusted, setSfuTrusted] = useState('');
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const { resolveSfuPin } = await import('@/lib/voice/sfu-pin');
+      const pin = await resolveSfuPin(group.id, 800);
+      if (cancelled) return;
+      if (pin) {
+        setSfuPubkey(pin.pubkey);
+        setSfuUrl(pin.url);
+        setSfuTrusted(pin.trustedRelays.join(', '));
+      } else {
+        const envPubkey = process.env.NEXT_PUBLIC_SFU_PUBKEY ?? '';
+        const envUrl = process.env.NEXT_PUBLIC_SFU_URL ?? '';
+        const envTrusted = process.env.NEXT_PUBLIC_SFU_TRUSTED_RELAYS ?? '';
+        setSfuPubkey(envPubkey);
+        setSfuUrl(envUrl);
+        setSfuTrusted(envTrusted);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [group.id]);
+
   async function saveMeta(e: React.FormEvent) {
     e.preventDefault();
     setSavingMeta(true);
@@ -2710,6 +2738,32 @@ function ChannelSettingsModal({ group, onClose }: { group: JsGroup; onClose: () 
         isOpen,
         kind: channelKind,
       });
+      // Persist the SFU pin only when this is an SFU channel and the
+      // admin filled in the pubkey + URL. Empty fields => skip publish
+      // (the channel falls through to advertisement / env-var defaults).
+      if (channelKind === 'voice-sfu') {
+        const pkTrim = sfuPubkey.trim().toLowerCase();
+        const urlTrim = sfuUrl.trim();
+        const trustedList = sfuTrusted
+          .split(/[\s,]+/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+        if (pkTrim && urlTrim) {
+          if (!/^[0-9a-f]{64}$/.test(pkTrim)) throw new Error('SFU pubkey must be 64-char hex');
+          if (!/^https?:\/\//.test(urlTrim)) throw new Error('SFU URL must be http(s)://');
+          for (const r of trustedList) {
+            if (!r.startsWith('wss://') && !r.startsWith('ws://')) {
+              throw new Error(`Trusted relay must be ws(s)://: ${r}`);
+            }
+          }
+          const { publishSfuPin } = await import('@/lib/voice/sfu-pin');
+          await publishSfuPin(group.id, {
+            pubkey: pkTrim,
+            url: urlTrim,
+            trustedRelays: trustedList,
+          });
+        }
+      }
       onClose();
     } catch (err) {
       setMetaErr((err as Error).message);
@@ -2882,13 +2936,53 @@ function ChannelSettingsModal({ group, onClose }: { group: JsGroup; onClose: () 
                 </p>
               )}
               {channelKind === 'voice-sfu' && (
-                <p className="text-[11px] text-lc-muted">
-                  Adds a <code className="text-lc-white/80">[&quot;t&quot;,&quot;voice-sfu&quot;]</code> tag.
-                  Same join surface as voice, but the channel signals to operators &ldquo;expect a big
-                  room&rdquo;. An authorized SFU joins and forwards everyone&rsquo;s media so the room scales
-                  past the 8-peer mesh ceiling. See{' '}
-                  <code className="text-lc-white/80">docs/sfu-system.md</code>.
-                </p>
+                <>
+                  <p className="text-[11px] text-lc-muted">
+                    Adds a <code className="text-lc-white/80">[&quot;t&quot;,&quot;voice-sfu&quot;]</code> tag.
+                    Same join surface as voice, but the channel signals to operators &ldquo;expect a big
+                    room&rdquo;. An authorized SFU joins and forwards everyone&rsquo;s media so the room scales
+                    past the 8-peer mesh ceiling.
+                  </p>
+                  <div className="space-y-2 rounded-lg border border-lc-border bg-lc-black/40 p-3">
+                    <p className="text-[11px] uppercase tracking-wider text-lc-muted">SFU operator (kind 30078 pin)</p>
+                    <p className="text-[11px] text-lc-muted">
+                      Publishes a NIP-78 event so anyone joining this channel knows which SFU to talk to.
+                      Defaults to <code className="text-lc-white/80">sfu.obelisk.ar</code> — change the
+                      values to point at your own SFU. Leave blank to skip the pin and let clients fall
+                      back to discovery / build defaults.
+                    </p>
+                    <div>
+                      <label className="text-[11px] text-lc-muted">SFU pubkey (hex)</label>
+                      <input
+                        value={sfuPubkey}
+                        onChange={(e) => setSfuPubkey(e.target.value)}
+                        spellCheck={false}
+                        className={inputClasses + ' w-full font-mono text-xs'}
+                        placeholder="64-char hex"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[11px] text-lc-muted">SFU URL</label>
+                      <input
+                        value={sfuUrl}
+                        onChange={(e) => setSfuUrl(e.target.value)}
+                        spellCheck={false}
+                        className={inputClasses + ' w-full font-mono text-xs'}
+                        placeholder="https://sfu.example.com"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[11px] text-lc-muted">Trusted-author relays (comma-separated)</label>
+                      <input
+                        value={sfuTrusted}
+                        onChange={(e) => setSfuTrusted(e.target.value)}
+                        spellCheck={false}
+                        className={inputClasses + ' w-full font-mono text-xs'}
+                        placeholder="wss://relay.example.com"
+                      />
+                    </div>
+                  </div>
+                </>
               )}
               {channelKind === 'forum' && (
                 <p className="text-[11px] text-lc-muted">
