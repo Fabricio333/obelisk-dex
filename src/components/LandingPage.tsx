@@ -186,21 +186,8 @@ export default function LandingPage() {
       <div className="relative z-10">
       <Navbar onLoginSuccess={handleLoginSuccess} />
 
-      {/* Sister-project cross-link banner */}
-      <section className="pt-24 pb-0 px-6 relative z-20">
-        <div className="max-w-4xl mx-auto">
-          <a
-            href="https://classic.obelisk.ar"
-            className="block text-center bg-lc-green/10 hover:bg-lc-green/20 border border-lc-green/30 rounded-xl px-4 py-3 text-sm text-lc-white transition-colors"
-          >
-            Want server-backed channels with custom roles, moderation and a hosted database? Visit{' '}
-            <span className="text-lc-green font-semibold">classic.obelisk.ar</span> →
-          </a>
-        </div>
-      </section>
-
       {/* Hero */}
-      <section className="relative pt-12 pb-24 px-6 overflow-hidden">
+      <section className="relative pt-24 pb-24 px-6 overflow-hidden">
         {/* Glow behind obelisk */}
         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-lc-green/5 rounded-full blur-[120px] pointer-events-none" />
 
